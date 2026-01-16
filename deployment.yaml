@@ -51,10 +51,21 @@ spec:
         app: tekton-queue
     spec:
       serviceAccountName: queue-controller
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        fsGroup: 1001
       containers:
         - name: manager
           image: docker.io/tekton-queue-controller:v0.1.0
           imagePullPolicy: Always
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
           resources:
             requests:
               memory: "128Mi"
