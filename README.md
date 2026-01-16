@@ -57,13 +57,6 @@ spec:
               properties:
                 maxPipelines:
                   type: integer
-  scope: Cluster
-  names:
-    plural: globallimits
-    singular: globallimit
-    kind: GlobalLimit
-    shortNames:
-      - gl
 
 ```
 
