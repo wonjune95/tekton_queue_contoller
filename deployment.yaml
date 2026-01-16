@@ -55,6 +55,13 @@ spec:
         - name: manager
           image: docker.io/tekton-queue-controller:v0.1.0
           imagePullPolicy: Always
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
 ---
 apiVersion: tekton.devops/v1
 kind: GlobalLimit
