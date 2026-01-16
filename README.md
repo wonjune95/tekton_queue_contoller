@@ -76,7 +76,7 @@ spec:
 apiVersion: tekton.devops/v1
 kind: GlobalLimit
 metadata:
-  name: my-limit
+  name: tekton-queue-limit
 spec:
   maxPipelines: 2  # 동시에 2개까지만 실행 허용
 
@@ -100,10 +100,16 @@ metadata:
   name: queue-controller-cluster-role
 rules:
   - apiGroups: ["tekton.dev"]
-    resources: ["pipelineruns"]
+    resources: ["pipelineruns", "pipelineruns/status"]
     verbs: ["list", "watch", "get", "patch", "update", "delete", "create"]
   - apiGroups: ["tekton.devops"]
     resources: ["globallimits"]
+    verbs: ["list", "watch", "get"]
+  - apiGroups: [""]
+    resources: ["events", "namespaces"]
+    verbs: ["create", "list", "watch"]
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
     verbs: ["list", "watch", "get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -137,7 +143,7 @@ spec:
       serviceAccountName: queue-controller
       containers:
         - name: manager
-          image: harbor.conechain.info/nnd/tekton/queue/tekton-queue-controller:v4.0.0 # 빌드한 이미지 주소
+          image: harbor.conechain.info/nnd/tekton/queue/tekton-queue-controller:v0.1.0 # 빌드한 이미지 주소
           imagePullPolicy: Always
 
 ```
@@ -191,8 +197,8 @@ CMD ["python", "-u", "/controller.py"]
 ```
 
 ```bash
-docker build -t your-registry/tekton-queue-controller:v4.0.0 .
-docker push your-registry/tekton-queue-controller:v4.0.0
+docker build -t your-registry/tekton-queue-controller:v0.1.0 .
+docker push your-registry/tekton-queue-controller:v0.1.0
 
 ```
 
