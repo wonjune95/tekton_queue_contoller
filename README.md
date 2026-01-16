@@ -92,7 +92,7 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: queue-controller
-  namespace: nd-cicd  # 컨트롤러가 설치될 네임스페이스
+  namespace: tekton-pipelines  # 컨트롤러가 설치될 네임스페이스
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -117,13 +117,13 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: queue-controller
-    namespace: nd-cicd
+    namespace: tekton-pipelines
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: tekton-queue-controller
-  namespace: nd-cicd
+  namespace: tekton-pipelines
 spec:
   replicas: 1
   selector:
