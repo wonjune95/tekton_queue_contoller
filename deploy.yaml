@@ -73,10 +73,3 @@ spec:
             limits:
               memory: "256Mi"
               cpu: "500m"
----
-apiVersion: tekton.devops/v1
-kind: GlobalLimit
-metadata:
-  name: tekton-queue-limit
-spec:
-  maxPipelines: 10      # 큐잉 갯수
