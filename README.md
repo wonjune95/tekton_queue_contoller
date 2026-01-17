@@ -136,7 +136,7 @@ spec:
       serviceAccountName: queue-controller
       containers:
         - name: manager
-          image: harbor.conechain.info/nnd/tekton/queue/tekton-queue-controller:v0.1.0 # 빌드한 이미지 주소
+          image: docker.io/tekton/tekton-queue-controller:v0.1.0 # 빌드한 이미지 주소
           imagePullPolicy: Always
 
 ```
