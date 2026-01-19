@@ -1,8 +1,9 @@
 import time
-import datetime
 import threading
 import fnmatch
 import copy
+import json  # <--- [필수] ResourceVersion 파싱용
+import sys
 from kubernetes import client, config, watch
 from kubernetes.client.rest import ApiException
 
@@ -13,6 +14,10 @@ DEFAULT_LIMIT = 10
 MANAGED_LABEL_KEY = "queue.tekton.dev/managed"
 MANAGED_LABEL_VAL = "yes"
 # =========================================================
+
+# 로깅 헬퍼: 버퍼링 없이 즉시 출력 (컨테이너 환경 필수)
+def log(msg):
+    print(f"{msg}", flush=True)
 
 try:
     config.load_incluster_config()
@@ -35,23 +40,22 @@ def add_managed_label(name, namespace):
     try:
         body = {'metadata': {'labels': {MANAGED_LABEL_KEY: MANAGED_LABEL_VAL}}}
         api.patch_namespaced_custom_object('tekton.dev', 'v1', namespace, 'pipelineruns', name, body)
-        print(f"🏷️ [등록] {namespace}/{name} -> 관리 대상 지정")
+        log(f"🏷️ [등록] {namespace}/{name} -> 관리 대상 지정")
     except: pass
 
 def patch_status(name, namespace, status_val):
-    """일반적인 상태 변경 (성공하면 True, 실패하면 False 리턴)"""
+    """일반적인 상태 변경"""
     try:
         body = {'spec': {'status': status_val}}
         api.patch_namespaced_custom_object(
             'tekton.dev', 'v1', namespace, 'pipelineruns', name, body
         )
         msg = "🚀 실행 시작" if status_val is None else "⛔ 대기 처리"
-        print(f"[{msg}] {namespace}/{name}")
+        log(f"[{msg}] {namespace}/{name}")
         return True
     except ApiException as e:
-        # 이미 시작돼서(Started) 변경 불가능한 경우 -> 실패 리턴 -> 강제 집행 로직으로 넘어감
-        if e.status == 400:
-            print(f"⚠️ [변경 불가] {namespace}/{name}: 이미 실행되어 Pending 전환 실패.")
+        if e.status == 400 or e.status == 422:
+            log(f"⚠️ [변경 불가] {namespace}/{name}: 이미 실행되어 Pending 전환 실패.")
             return False
         return False
     except:
@@ -59,56 +63,56 @@ def patch_status(name, namespace, status_val):
 
 def recreate_as_pending(original_obj):
     """
-    [핵심 로직] 실행되어버린 파이프라인을 '삭제'하고 'Pending 상태로 복제'
+    [핵심 로직] 실행된 파이프라인을 삭제 후 대기 상태로 재생성
     """
     ns = original_obj['metadata']['namespace']
     name = original_obj['metadata']['name']
 
-    print(f"👮 [강제 집행] {ns}/{name} -> 즉시 삭제 후 대기열로 재등록합니다.")
+    log(f"👮 [강제 집행] {ns}/{name} -> 즉시 삭제 후 대기열로 재등록합니다.")
 
-    # 1. 기존 파이프라인 삭제 (Background 삭제로 리소스 정리)
+    # 1. 삭제 (Background)
     try:
         api.delete_namespaced_custom_object(
             'tekton.dev', 'v1', ns, 'pipelineruns', name,
             body=client.V1DeleteOptions(propagation_policy='Background')
         )
     except Exception as e:
-        print(f"❌ 삭제 실패: {e}")
+        log(f"❌ 삭제 실패: {e}")
         return
 
-    # 2. 새 객체 준비 (기존 스펙 복사)
+    # 2. 객체 복제 및 클린업
     new_obj = copy.deepcopy(original_obj)
 
-    # 메타데이터 정리 (시스템이 부여한 필드 제거)
-    if 'resourceVersion' in new_obj['metadata']: del new_obj['metadata']['resourceVersion']
-    if 'uid' in new_obj['metadata']: del new_obj['metadata']['uid']
-    if 'creationTimestamp' in new_obj['metadata']: del new_obj['metadata']['creationTimestamp']
-    if 'ownerReferences' in new_obj['metadata']: del new_obj['metadata']['ownerReferences']
+    # 시스템 필드 제거 (중요: 이 필드들이 있으면 생성 거부됨)
+    for key in ['resourceVersion', 'uid', 'creationTimestamp', 'ownerReferences', 'generation']:
+        if key in new_obj['metadata']:
+            del new_obj['metadata'][key]
 
-    # 상태값 초기화 (이전 실행 기록 삭제)
+    # 상태 초기화
     if 'status' in new_obj: del new_obj['status']
 
-    # [중요] Pending 상태로 설정 + 관리 라벨 부착
+    # Pending 설정
     if 'spec' not in new_obj: new_obj['spec'] = {}
     new_obj['spec']['status'] = 'PipelineRunPending'
 
     if 'labels' not in new_obj['metadata']: new_obj['metadata']['labels'] = {}
     new_obj['metadata']['labels'][MANAGED_LABEL_KEY] = MANAGED_LABEL_VAL
 
-    # 이름 변경 (기존 이름 + "-queued")
-    # 기존 이름이 너무 길면 잘라냄 (K8s 이름 길이 제한 63자 고려)
-    base_name = name[:50]
-    new_obj['metadata']['name'] = f"{base_name}-q{int(time.time())}" # 유니크하게 생성
+    # 이름 변경 (유니크성 보장)
+    base_name = name[:40] # 길이 제한 고려
+    new_obj['metadata']['name'] = f"{base_name}-q{int(time.time())}"
 
-    # 3. 신규 생성
+    # 3. 재생성
     try:
         api.create_namespaced_custom_object('tekton.dev', 'v1', ns, 'pipelineruns', new_obj)
-        print(f"✅ [재등록 완료] {ns}/{new_obj['metadata']['name']} (대기 중)")
+        log(f"✅ [재등록 완료] {ns}/{new_obj['metadata']['name']} (대기 중)")
     except Exception as e:
-        print(f"❌ 재생성 실패: {e}")
+        log(f"❌ 재생성 실패: {e}")
 
 def get_queue_status():
+    """현재 큐 상태 조회 (Running 개수, Pending 목록)"""
     try:
+        # 최적화: field_selector나 label_selector를 쓰면 좋지만, 로직 유지를 위해 전체 조회 후 필터링
         resp = api.list_cluster_custom_object('tekton.dev', 'v1', 'pipelineruns')
         items = resp.get('items', [])
     except:
@@ -125,24 +129,24 @@ def get_queue_status():
         conditions = item.get('status', {}).get('conditions', [])
         labels = item['metadata'].get('labels', {})
 
-        if conditions and conditions[0]['status'] in ['True', 'False']:
+        # 이미 끝난(Succeeded/Failed) 파이프라인은 카운트 제외
+        if conditions and conditions[0]['status'] != 'Unknown':
             continue
 
-        # Running 상태면 무조건 카운트
         if spec_status != 'PipelineRunPending':
             running_cnt += 1
-        # Pending이면서 관리 라벨이 있어야 대기열
         elif labels.get(MANAGED_LABEL_KEY) == MANAGED_LABEL_VAL:
             managed_pending_list.append(item)
 
+    # 먼저 생성된 순서대로 정렬 (FIFO)
     managed_pending_list.sort(key=lambda x: x['metadata']['creationTimestamp'])
     return running_cnt, managed_pending_list
 
 # ---------------------------------------------------------
-# [Thread 1] 매니저
+# [Thread 1] 매니저 (주기적 실행 담당)
 # ---------------------------------------------------------
 def manager_loop():
-    print("👷 매니저 시작")
+    log("👷 매니저 시작")
     while True:
         try:
             limit = get_limit_from_crd()
@@ -155,63 +159,105 @@ def manager_loop():
                 for target in to_run:
                     t_name = target['metadata']['name']
                     t_ns = target['metadata']['namespace']
-                    print(f"⚡ 자리 남음({running}/{limit}). {t_ns}/{t_name} 입장!")
-                    patch_status(t_name, t_ns, None)
-                    running += 1
-                    slots -= 1
+                    log(f"⚡ 자리 남음({running}/{limit}). {t_ns}/{t_name} 입장!")
+                    
+                    # 실행 시도
+                    if patch_status(t_name, t_ns, None):
+                        running += 1
+                        slots -= 1
         except Exception as e:
-            print(f"⚠️ 매니저 에러: {e}")
+            log(f"⚠️ 매니저 에러: {e}")
         time.sleep(5)
 
 # ---------------------------------------------------------
-# [Thread 2] 왓쳐 (경찰)
+# [Thread 2] 왓쳐 (감시 및 단속 담당)
 # ---------------------------------------------------------
 def watcher_loop():
-    print("👀 왓쳐 시작")
+    log("👀 왓쳐 시작")
+    
+    resource_version = None
+
     while True:
-        w = watch.Watch()
         try:
+            # 1. [List 단계] 최초 연결 시, 현재 시점의 resourceVersion 획득
+            if resource_version is None:
+                log("🔄 [동기화] 현재 클러스터 시점 조회 중...")
+                # _preload_content=False: 데이터 전체를 객체로 만들지 않고 헤더만 빠르게 읽음 (메모리 절약)
+                raw_resp = api.list_cluster_custom_object(
+                    'tekton.dev', 'v1', 'pipelineruns', _preload_content=False
+                )
+                # JSON 헤더 파싱
+                data = json.loads(raw_resp.data)
+                resource_version = data['metadata']['resourceVersion']
+                log(f"📍 기준점 획득: {resource_version} (이 시점 이후부터 감시)")
+
+            # 2. [Watch 단계] 획득한 버전 '이후'의 변경사항만 스트리밍 (부하 99% 감소)
+            w = watch.Watch()
             stream = w.stream(
                 api.list_cluster_custom_object,
                 'tekton.dev', 'v1', 'pipelineruns',
-                timeout_seconds=0
+                resource_version=resource_version,
+                timeout_seconds=0 # 무한 대기 (끊어지면 재연결)
             )
+
             for event in stream:
+                obj = event['object']
+                # 다음 재연결을 위해 ResourceVersion 갱신
+                resource_version = obj['metadata']['resourceVersion']
+
                 if event['type'] == 'ADDED':
-                    obj = event['object']
                     ns = obj['metadata']['namespace']
                     name = obj['metadata']['name']
                     spec_status = obj.get('spec', {}).get('status')
-
+                    
+                    # 대상 네임스페이스가 아니거나 이미 Pending이면 무시
                     if not is_target_namespace(ns): continue
-
-                    # 1. 템플릿(이미 Pending)은 무시
                     if spec_status == 'PipelineRunPending': continue
+                    
+                    # 이미 종료된 파이프라인 무시 (Watch 재연결 시 과거 이벤트 필터링)
+                    conds = obj.get('status', {}).get('conditions', [])
+                    if conds and conds[0]['status'] != 'Unknown': continue
 
-                    # 2. 일단 관리 대상 등록
+                    # 관리 라벨 부착
                     add_managed_label(name, ns)
 
-                    # 3. 과속 단속 (자리 없는데 실행됨?)
+                    # 과속 단속
                     limit = get_limit_from_crd()
                     running, _ = get_queue_status()
 
+                    # 실행 중인 개수가 리미트를 초과했다면?
                     if running > limit:
-                        print(f"🚨 [과속 감지] {ns}/{name} (현재 {running-1}/{limit})")
-
-                        # 1차 시도: Patch로 얌전히 멈춰본다.
+                        log(f"🚨 [과속 감지] {ns}/{name} (Limit: {limit}, Current: {running})")
+                        
+                        # 1차: Patch 시도
                         success = patch_status(name, ns, 'PipelineRunPending')
-
-                        # 2차 시도: Tekton이 거부하면(이미 시작됨)? -> 강제 집행(삭제 후 재생성)
+                        
+                        # 2차: 실패 시 강제 재생성 (Recreate)
                         if not success:
                             recreate_as_pending(obj)
 
-        except ApiException: pass
-        except Exception as e:
-            print(f"⚠️ 왓쳐 에러: {e}")
+        except ApiException as e:
+            # 410 Gone: ResourceVersion이 너무 오래됨 -> 초기화 후 다시 List
+            if e.status == 410:
+                log("⚠️ 버전 만료 (410). 전체 목록 다시 조회합니다.")
+                resource_version = None
+            else:
+                log(f"⚠️ API 에러: {e}")
             time.sleep(1)
+            
+        except Exception as e:
+            log(f"⚠️ 왓쳐 내부 에러: {e}")
+            # 알 수 없는 에러 시 안전하게 다시 List부터 시작
+            resource_version = None
+            time.sleep(2)
 
 if __name__ == "__main__":
-    t1 = threading.Thread(target=manager_loop)
-    t2 = threading.Thread(target=watcher_loop)
+    t1 = threading.Thread(target=manager_loop, daemon=True)
+    t2 = threading.Thread(target=watcher_loop, daemon=True)
     t1.start(); t2.start()
-    t1.join(); t2.join()
+    
+    # 메인 스레드가 죽지 않게 유지
+    try:
+        while True: time.sleep(1)
+    except KeyboardInterrupt:
+        log("🛑 프로그램 종료")
