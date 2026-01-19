@@ -8,17 +8,20 @@ from kubernetes import client, config, watch
 from kubernetes.client.rest import ApiException
 
 # =========================================================
-# [설정]
+# 관리 대상 네임스페이스 규칙
 NAMESPACE_PATTERN = "*-cicd"
+
+# CRD 조회가 실패할 경우 적용할 기본 동시 실행 제한 수
 DEFAULT_LIMIT = 10
+
+# 컨트롤러가 관리중임을 표시하는 식별 라벨
 MANAGED_LABEL_KEY = "queue.tekton.dev/managed"
 MANAGED_LABEL_VAL = "yes"
 # =========================================================
 
-# 로깅 헬퍼: 버퍼링 없이 즉시 출력 (컨테이너 환경 필수)
+# 컨테이너 환경에서는 표준 출력 버퍼링 때문에 로그가 남지 않고 유실될 수 있음, 강제 출력 보
 def log(msg):
     print(f"{msg}", flush=True)
-
 try:
     config.load_incluster_config()
 except:
@@ -27,9 +30,11 @@ except:
 api = client.CustomObjectsApi()
 
 def is_target_namespace(namespace):
+    # 설정된 패턴(*-cicd)과 일치하는 네임스페이스인지 검증
     return fnmatch.fnmatch(namespace, NAMESPACE_PATTERN)
 
 def get_limit_from_crd():
+    # ConfigMap에서 실시간으로 제한 값을 가져옴
     try:
         obj = api.get_cluster_custom_object('tekton.devops', 'v1', 'globallimits', 'tekton-queue-limit')
         return int(obj['spec']['maxPipelines'])
@@ -37,6 +42,7 @@ def get_limit_from_crd():
         return DEFAULT_LIMIT
 
 def add_managed_label(name, namespace):
+    # Tekton PipelineRun에 관리용 라벨 부착
     try:
         body = {'metadata': {'labels': {MANAGED_LABEL_KEY: MANAGED_LABEL_VAL}}}
         api.patch_namespaced_custom_object('tekton.dev', 'v1', namespace, 'pipelineruns', name, body)
@@ -44,7 +50,11 @@ def add_managed_label(name, namespace):
     except: pass
 
 def patch_status(name, namespace, status_val):
-    """일반적인 상태 변경"""
+    """
+    상태 변경 로직
+    - status_val=None 대기 해제(실행 시작)
+    - status_val='PipelineRunPending' 대기 상태로 전환
+    """
     try:
         body = {'spec': {'status': status_val}}
         api.patch_namespaced_custom_object(
@@ -63,12 +73,16 @@ def patch_status(name, namespace, status_val):
 
 def recreate_as_pending(original_obj):
     """
-    [핵심 로직] 실행된 파이프라인을 삭제 후 대기 상태로 재생성
+    Fail-Safe 로직: 강제 집행
+    이미 실행되어버린(Running) 파이프라인이 제한을 초과했다면,
+    해당 리소스를 '삭제'하고 'Pending 상태로 복제'하여 대기열로 강제 이동시킴.
+    
+    * 주의: 이미 생성된 Pod는 종료되며, 파이프라인 ID(UID)가 변경됨.
     """
     ns = original_obj['metadata']['namespace']
     name = original_obj['metadata']['name']
 
-    log(f"👮 [강제 집행] {ns}/{name} -> 즉시 삭제 후 대기열로 재등록합니다.")
+    log(f"[강제 집행] {ns}/{name} -> 즉시 삭제 후 대기열로 재등록합니다.")
 
     # 1. 삭제 (Background)
     try:
@@ -110,9 +124,12 @@ def recreate_as_pending(original_obj):
         log(f"재생성 실패: {e}")
 
 def get_queue_status():
-    """현재 큐 상태 조회 (Running 개수, Pending 목록)"""
+    """
+    큐 상태 스냅샷
+    현재 클러스터 내 '실행 중(Running)'인 파이프라인 수와
+    '대기 중(Pending)'인 파이프라인 목록을 반환.
+    """
     try:
-        # 최적화: field_selector나 label_selector를 쓰면 좋지만, 로직 유지를 위해 전체 조회 후 필터링
         resp = api.list_cluster_custom_object('tekton.dev', 'v1', 'pipelineruns')
         items = resp.get('items', [])
     except:
