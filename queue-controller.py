@@ -2,7 +2,7 @@ import time
 import threading
 import fnmatch
 import copy
-import json  # <--- [필수] ResourceVersion 파싱용
+import json
 import sys
 from kubernetes import client, config, watch
 from kubernetes.client.rest import ApiException
@@ -40,7 +40,7 @@ def add_managed_label(name, namespace):
     try:
         body = {'metadata': {'labels': {MANAGED_LABEL_KEY: MANAGED_LABEL_VAL}}}
         api.patch_namespaced_custom_object('tekton.dev', 'v1', namespace, 'pipelineruns', name, body)
-        log(f"🏷️ [등록] {namespace}/{name} -> 관리 대상 지정")
+        log(f"[등록] {namespace}/{name} -> 관리 대상 지정")
     except: pass
 
 def patch_status(name, namespace, status_val):
@@ -50,12 +50,12 @@ def patch_status(name, namespace, status_val):
         api.patch_namespaced_custom_object(
             'tekton.dev', 'v1', namespace, 'pipelineruns', name, body
         )
-        msg = "🚀 실행 시작" if status_val is None else "⛔ 대기 처리"
+        msg = "실행 시작" if status_val is None else "대기 처리"
         log(f"[{msg}] {namespace}/{name}")
         return True
     except ApiException as e:
         if e.status == 400 or e.status == 422:
-            log(f"⚠️ [변경 불가] {namespace}/{name}: 이미 실행되어 Pending 전환 실패.")
+            log(f"[변경 불가] {namespace}/{name}: 이미 실행되어 Pending 전환 실패.")
             return False
         return False
     except:
@@ -77,7 +77,7 @@ def recreate_as_pending(original_obj):
             body=client.V1DeleteOptions(propagation_policy='Background')
         )
     except Exception as e:
-        log(f"❌ 삭제 실패: {e}")
+        log(f"삭제 실패: {e}")
         return
 
     # 2. 객체 복제 및 클린업
@@ -105,9 +105,9 @@ def recreate_as_pending(original_obj):
     # 3. 재생성
     try:
         api.create_namespaced_custom_object('tekton.dev', 'v1', ns, 'pipelineruns', new_obj)
-        log(f"✅ [재등록 완료] {ns}/{new_obj['metadata']['name']} (대기 중)")
+        log(f"[재등록 완료] {ns}/{new_obj['metadata']['name']} (대기 중)")
     except Exception as e:
-        log(f"❌ 재생성 실패: {e}")
+        log(f"재생성 실패: {e}")
 
 def get_queue_status():
     """현재 큐 상태 조회 (Running 개수, Pending 목록)"""
@@ -146,7 +146,7 @@ def get_queue_status():
 # [Thread 1] 매니저 (주기적 실행 담당)
 # ---------------------------------------------------------
 def manager_loop():
-    log("👷 매니저 시작")
+    log("매니저 시작")
     while True:
         try:
             limit = get_limit_from_crd()
@@ -159,21 +159,21 @@ def manager_loop():
                 for target in to_run:
                     t_name = target['metadata']['name']
                     t_ns = target['metadata']['namespace']
-                    log(f"⚡ 자리 남음({running}/{limit}). {t_ns}/{t_name} 입장!")
+                    log(f"자리 남음({running}/{limit}). {t_ns}/{t_name} 입장!")
                     
                     # 실행 시도
                     if patch_status(t_name, t_ns, None):
                         running += 1
                         slots -= 1
         except Exception as e:
-            log(f"⚠️ 매니저 에러: {e}")
+            log(f"매니저 에러: {e}")
         time.sleep(5)
 
 # ---------------------------------------------------------
 # [Thread 2] 왓쳐 (감시 및 단속 담당)
 # ---------------------------------------------------------
 def watcher_loop():
-    log("👀 왓쳐 시작")
+    log("왓쳐 시작")
     
     resource_version = None
 
@@ -181,7 +181,7 @@ def watcher_loop():
         try:
             # 1. [List 단계] 최초 연결 시, 현재 시점의 resourceVersion 획득
             if resource_version is None:
-                log("🔄 [동기화] 현재 클러스터 시점 조회 중...")
+                log("[동기화] 현재 클러스터 시점 조회 중...")
                 # _preload_content=False: 데이터 전체를 객체로 만들지 않고 헤더만 빠르게 읽음 (메모리 절약)
                 raw_resp = api.list_cluster_custom_object(
                     'tekton.dev', 'v1', 'pipelineruns', _preload_content=False
@@ -189,7 +189,7 @@ def watcher_loop():
                 # JSON 헤더 파싱
                 data = json.loads(raw_resp.data)
                 resource_version = data['metadata']['resourceVersion']
-                log(f"📍 기준점 획득: {resource_version} (이 시점 이후부터 감시)")
+                log(f"기준점 획득: {resource_version} (이 시점 이후부터 감시)")
 
             # 2. [Watch 단계] 획득한 버전 '이후'의 변경사항만 스트리밍 (부하 99% 감소)
             w = watch.Watch()
@@ -227,7 +227,7 @@ def watcher_loop():
 
                     # 실행 중인 개수가 리미트를 초과했다면?
                     if running > limit:
-                        log(f"🚨 [과속 감지] {ns}/{name} (Limit: {limit}, Current: {running})")
+                        log(f"[과속 감지] {ns}/{name} (Limit: {limit}, Current: {running})")
                         
                         # 1차: Patch 시도
                         success = patch_status(name, ns, 'PipelineRunPending')
@@ -239,14 +239,14 @@ def watcher_loop():
         except ApiException as e:
             # 410 Gone: ResourceVersion이 너무 오래됨 -> 초기화 후 다시 List
             if e.status == 410:
-                log("⚠️ 버전 만료 (410). 전체 목록 다시 조회합니다.")
+                log("버전 만료 (410). 전체 목록 다시 조회합니다.")
                 resource_version = None
             else:
-                log(f"⚠️ API 에러: {e}")
+                log(f"API 에러: {e}")
             time.sleep(1)
             
         except Exception as e:
-            log(f"⚠️ 왓쳐 내부 에러: {e}")
+            log(f"왓쳐 내부 에러: {e}")
             # 알 수 없는 에러 시 안전하게 다시 List부터 시작
             resource_version = None
             time.sleep(2)
@@ -260,4 +260,4 @@ if __name__ == "__main__":
     try:
         while True: time.sleep(1)
     except KeyboardInterrupt:
-        log("🛑 프로그램 종료")
+        log("프로그램 종료")
