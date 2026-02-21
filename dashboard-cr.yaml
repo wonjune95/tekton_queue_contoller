@@ -1,0 +1,27 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: tekton-dashboard-globallimit-viewer
+rules:
+- apiGroups:
+  - "tekton.devops"
+  resources:
+  - "globallimits"
+  verbs:
+  - "get"
+  - "list"
+  - "watch"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: tekton-dashboard-globallimit-binding
+subjects:
+- kind: ServiceAccount
+  name: tekton-dashboard           # 설치된 대시보드의 실제 ServiceAccount
+  namespace: tekton-pipeline       # 대시보드가 설치된 네임스페이스
+roleRef:
+  kind: ClusterRole
+  name: tekton-dashboard-globallimit-viewer
+  apiGroup: rbac.authorization.k8s.io
