@@ -1,4 +1,4 @@
-# Tekton Global Queue Controller (Webhook Edition)
+# Tekton Global Queue Controller
 
 다수의 네임스페이스에 걸쳐 실행되는 Tekton PipelineRun의 **전역 동시 실행 개수(Global Concurrency Limits)**를 통제하기 위한 경량화된 Flask 기반의 Kubernetes Mutating Admission Webhook 및 컨트롤러입니다.
 
