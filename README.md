@@ -24,9 +24,10 @@ Tekton Pipelines는 기본적으로 네임스페이스별 리소스 할당량(Re
 ## 2. 연동 대시보드 (Custom Dashboard)
 
 본 컨트롤러가 관리하는 Global Queue 상태를 웹 UI에서 직관적으로 모니터링하고 제어하려면, 맞춤형으로 제작된 아래의 오픈소스 대시보드를 함께 사용하는 것을 권장합니다.
+<img width="1901" height="908" alt="스크린샷 2026-03-02 190526" src="https://github.com/user-attachments/assets/b2d062ae-370f-4a41-b1d6-be36ed03a076" />
 
 🔗 **[wonjune95/tekton_ui_custom_dashboard](https://github.com/wonjune95/tekton_ui_custom_dashboard)**
-![alt text](image.png)
+
 *해당 대시보드가 K8s 클러스터 내의 `GlobalLimit` CRD 자원에 접근할 수 있도록, 설치 과정(`deploy.yaml`)에 필수 RBAC 권한이 포함되어 있습니다.*
 
 ---
