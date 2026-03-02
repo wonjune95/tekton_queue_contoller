@@ -1,9 +1,3 @@
-**핵심 요약**
-
-요청하신 대로 대시보드 리포지토리 링크(`wonjune95/tekton_ui_custom_dashboard`)를 소개하는 내용을 `README.md`에 추가하고, `deploy.yaml`에 기존의 `tekton-dashboard-globallimit-viewer` 권한 설정까지 모두 병합하여 K8s 배포 가이드를 통합했습니다.
-
----
-
 # Tekton Global Queue Controller (Webhook Edition)
 
 다수의 네임스페이스에 걸쳐 실행되는 Tekton PipelineRun의 **전역 동시 실행 개수(Global Concurrency Limits)**를 통제하기 위한 경량화된 Flask 기반의 Kubernetes Mutating Admission Webhook 및 컨트롤러입니다.
