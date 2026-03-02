@@ -35,6 +35,39 @@ subjects:
     name: queue-controller
     namespace: tekton-pipelines
 ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tekton-queue-webhook-service
+  namespace: tekton-pipelines
+spec:
+  ports:
+    - port: 443
+      targetPort: 8443
+  selector:
+    app: tekton-queue
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: tekton-queue-mutator
+webhooks:
+  - name: queue.mutator.tekton.dev
+    clientConfig:
+      service:
+        name: tekton-queue-webhook-service
+        namespace: tekton-pipelines
+        path: "/mutate"
+      caBundle: "<BASE64_ENCODED_CA_CERT_HERE>" # 주의: 실제 Base64 인코딩 값으로 교체하세요!
+    rules:
+      - operations: ["CREATE"]
+        apiGroups: ["tekton.dev"]
+        apiVersions: ["v1", "v1beta1"]
+        resources: ["pipelineruns"]
+    admissionReviewVersions: ["v1", "v1beta1"]
+    sideEffects: None
+    timeoutSeconds: 5
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -73,3 +106,13 @@ spec:
             limits:
               memory: "256Mi"
               cpu: "500m"
+          ports:
+            - containerPort: 8443
+          volumeMounts:
+            - name: cert-volume
+              mountPath: "/certs"
+              readOnly: true
+      volumes:
+        - name: cert-volume
+          secret:
+            secretName: tekton-queue-cacerts
