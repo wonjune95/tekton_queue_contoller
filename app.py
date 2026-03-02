@@ -1,4 +1,3 @@
-# 언어: Python
 import time
 import threading
 import fnmatch
