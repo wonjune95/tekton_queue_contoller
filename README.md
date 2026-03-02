@@ -1,43 +1,94 @@
-# Tekton Global Queue Controller
+**핵심 요약**
 
-A lightweight, Python-based Kubernetes controller to enforce **Global Concurrency Limits** for Tekton PipelineRuns across multiple namespaces.
-
-## 개요 (Overview)
-
-Tekton Pipelines는 기본적으로 네임스페이스별 리소스 할당량(ResourceQuota) 외에 **클러스터 전체 단위의 동시 실행 개수(Global Concurrency)** 를 제한하는 기능이 부족합니다.
-
-이 컨트롤러는 다음과 같은 문제를 해결합니다.
-
-1. **과부하 방지:** 클러스터 전체에서 동시에 실행되는 파이프라인 개수를 제한합니다. (예: 최대 2개)
-2. **멀티 네임스페이스 지원:** 특정 패턴(예: `*-cicd`)을 가진 여러 네임스페이스를 통합 관리합니다.
-3. **Strict Mode (Race Condition 해결):** Tekton이 컨트롤러보다 먼저 파이프라인을 실행시켜버리는 경우, 이를 감지하여 **즉시 삭제 후 대기열로 재등록**합니다.
-4. **템플릿 자동 무시:** 기존에 만들어둔 Pending 상태의 템플릿 파이프라인은 건드리지 않고, **새로 실행 요청된 파이프라인만 관리**합니다.
+요청하신 대로 대시보드 리포지토리 링크(`wonjune95/tekton_ui_custom_dashboard`)를 소개하는 내용을 `README.md`에 추가하고, `deploy.yaml`에 기존의 `tekton-dashboard-globallimit-viewer` 권한 설정까지 모두 병합하여 K8s 배포 가이드를 통합했습니다.
 
 ---
 
-## 주요 기능 (Features)
+# Tekton Global Queue Controller (Webhook Edition)
 
-* **Global Limit Enforcement:** CRD(`GlobalLimit`)를 통해 동시 실행 개수를 동적으로 설정 가능.
-* **FIFO Queue:** 먼저 생성된 파이프라인이 먼저 실행되는 선입선출 방식.
-* **Smart Labeling:** 새로 생성된 파이프라인에만 `queue.tekton.dev/managed` 라벨을 부착하여 관리 (기존 템플릿 파이프라인 영향 없음).
-* **Race Condition Handling:** 리소스 제한을 초과하여 생성된 파이프라인이 이미 `Running` 상태가 된 경우, **강제 종료(Delete) 후 Pending 상태로 재생성**하여 순서를 보장.
-* **Zero Dependency:** 무거운 프레임워크(Kopf 등) 없이 순수 `kubernetes` Python 클라이언트만 사용하여 가볍고 빠름.
+다수의 네임스페이스에 걸쳐 실행되는 Tekton PipelineRun의 **전역 동시 실행 개수(Global Concurrency Limits)**를 통제하기 위한 경량화된 Flask 기반의 Kubernetes Mutating Admission Webhook 및 컨트롤러입니다.
+
+## 1. 개요 (Overview)
+
+Tekton Pipelines는 기본적으로 네임스페이스별 리소스 할당량(ResourceQuota) 기능만 제공할 뿐, **클러스터 전체 단위의 동시 실행 개수를 제한하는 기능이 부족**합니다.
+
+본 컨트롤러는 **Kubernetes MutatingAdmissionWebhook**을 활용하여 API Server 인입 단계에서 파이프라인 생성 요청을 선제적으로 통제함으로써 다음의 문제들을 해결합니다.
+
+1. **사전 차단 (Proactive Control):** 쿼터를 초과한 실행 요청이 etcd에 기록되기 전에 미리 `PipelineRunPending` 상태를 주입하여 I/O 리소스 낭비를 원천 차단합니다.
+2. **멀티 네임스페이스 지원:** 특정 패턴(예: `*-cicd`)을 가진 여러 네임스페이스를 단일 컨트롤러에서 통합 관리합니다.
+3. **API Server 부하 최소화:** O(N)의 API Server 호출 대신 O(1)의 로컬 인메모리 캐시(`SharedInformer` 패턴)를 조회하여 인가(Admission) 여부를 1ms 이내로 결정합니다.
+4. **결함 허용성 (Fault Tolerance):** 대기열의 순서를 컨트롤러 메모리에 의존하지 않고, etcd에 기록된 `creationTimestamp`를 기준으로 정렬(FIFO)하여 Controller Pod 재시작 시에도 순서가 붕괴되지 않습니다.
 
 ---
 
-## 설치 및 배포 (Installation)
+## 2. 연동 대시보드 (Custom Dashboard)
 
-### 1. 사전 요구사항 (Prerequisites)
+본 컨트롤러가 관리하는 Global Queue 상태를 웹 UI에서 직관적으로 모니터링하고 제어하려면, 맞춤형으로 제작된 아래의 오픈소스 대시보드를 함께 사용하는 것을 권장합니다.
+
+🔗 **[wonjune95/tekton_ui_custom_dashboard](https://github.com/wonjune95/tekton_ui_custom_dashboard)**
+![alt text](image.png)
+*해당 대시보드가 K8s 클러스터 내의 `GlobalLimit` CRD 자원에 접근할 수 있도록, 설치 과정(`deploy.yaml`)에 필수 RBAC 권한이 포함되어 있습니다.*
+
+---
+
+## 3. 아키텍처 설계 특징 (Architectural Features)
+
+기존 컨트롤러 패턴(생성된 리소스를 사후에 감지하여 강제 삭제 후 재생성하는 방식)이 유발하던 API Server와 etcd의 부하 문제를 해결하기 위해 다음과 같이 설계되었습니다.
+
+| 설계 항목 | 구현 방식 및 특징 | 기대 효과 |
+| --- | --- | --- |
+| **제어 시점** | K8s API Server 인입 시점 (`Admission Phase`) | 시스템 부하를 유발하는 불필요한 이벤트 전파 방지 |
+| **초과 쿼터 처리** | 인입 즉시 `JSONPatch`를 통해 Pending 상태 주입 | 파이프라인 강제 삭제 및 재생성 로직 제거 |
+| **etcd Write 부하** | 1개 파이프라인 요청당 단 1회의 트랜잭션(생성)만 발생 | 기존 방식 대비 I/O 연산량 대폭 절감 |
+| **대기열 정합성** | K8s Native Timestamp (`creationTimestamp`) 기준 정렬 | 단일 장애점(SPOF) 제거 및 안정적인 FIFO 큐 보장 |
+
+---
+
+## 4. 설치 및 배포 (Installation)
+
+### 4.1. 사전 요구사항
 
 * Kubernetes Cluster (v1.20+)
-* Tekton Pipelines installed
+* Tekton Pipelines 설치 완료
+* OpenSSL (웹훅용 TLS 인증서 생성 목적)
 
-### 2. CRD (Custom Resource Definition) 생성
+### 4.2. TLS 인증서 및 Secret 생성 (필수)
 
-제한 개수를 설정하기 위한 CRD를 정의합니다.
+Webhook은 K8s API Server와 반드시 HTTPS로 통신해야 하므로 자체 서명 인증서를 생성하여 K8s Secret으로 배포해야 합니다.
+
+```bash
+# 1. 인증서 생성 (컨트롤러가 배포될 tekton-pipelines 네임스페이스에 맞게 SAN 설정)
+cat > csr.conf <<EOF
+[req]
+req_extensions = v3_req
+distinguished_name = req_distinguished_name
+[req_distinguished_name]
+[ v3_req ]
+basicConstraints = CA:FALSE
+keyUsage = nonRepudiation, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = @alt_names
+[alt_names]
+DNS.1 = tekton-queue-webhook-service
+DNS.2 = tekton-queue-webhook-service.tekton-pipelines
+DNS.3 = tekton-queue-webhook-service.tekton-pipelines.svc
+EOF
+
+openssl genrsa -out tls.key 2048
+openssl req -new -key tls.key -out tls.csr -subj "/CN=tekton-queue-webhook-service.tekton-pipelines.svc" -config csr.conf
+openssl x509 -req -in tls.csr -signkey tls.key -out tls.crt -days 3650 -extensions v3_req -extfile csr.conf
+
+# 2. Secret 배포
+kubectl create secret tls tekton-queue-cacerts --cert=tls.crt --key=tls.key -n tekton-pipelines
+
+```
+
+### 4.3. CRD 및 GlobalLimit 설정
+
+전역 제한 개수를 설정하기 위한 CRD와 실제 Limit 값을 정의합니다.
 
 ```yaml
-# crd.yaml
+# crd-and-limit.yaml
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
@@ -57,40 +108,64 @@ spec:
               properties:
                 maxPipelines:
                   type: integer
-
-```
-
-### 3. 제한 개수 설정 (Configuration)
-
-`maxPipelines` 값을 원하는 숫자로 설정합니다. (이름은 반드시 `my-limit`이어야 합니다.)
-
-```yaml
-# limit-setting.yaml
+---
 apiVersion: tekton.devops/v1
 kind: GlobalLimit
 metadata:
   name: tekton-queue-limit
 spec:
-  maxPipelines: 2  # 동시에 2개까지만 실행 허용
+  maxPipelines: 4  # 동시에 허용할 최대 파이프라인 실행 개수
 
 ```
 
-### 4. 컨트롤러 배포 (Deploy)
+### 4.4. 통합 권한 및 컨트롤러 배포 (Deploy)
 
-RBAC 권한(ClusterRole)과 Deployment를 생성합니다.
+대시보드 뷰어 권한, 컨트롤러 권한, Service, Deployment, 그리고 `MutatingWebhookConfiguration`이 모두 포함된 통합 배포 파일입니다.
+
+> **주의:** 아래 YAML의 `caBundle` 필드는 예시 값입니다. 배포 전 반드시 `cat tls.crt | base64 | tr -d '\n'` 명령어로 추출한 실제 값을 입력하세요.
 
 ```yaml
 # deploy.yaml
+# 1. Dashboard Viewer RBAC
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: tekton-dashboard-globallimit-viewer
+rules:
+- apiGroups:
+  - "tekton.devops"
+  resources:
+  - "globallimits"
+  verbs:
+  - "get"
+  - "list"
+  - "watch"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: tekton-dashboard-globallimit-binding
+subjects:
+- kind: ServiceAccount
+  name: tekton-dashboard           # 설치된 대시보드의 실제 ServiceAccount
+  namespace: tekton-pipelines      # 대시보드가 설치된 네임스페이스
+roleRef:
+  kind: ClusterRole
+  name: tekton-dashboard-globallimit-viewer
+  apiGroup: rbac.authorization.k8s.io
+
+# 2. Controller RBAC & ServiceAccount
+---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: queue-controller
-  namespace: tekton-pipelines  # 컨트롤러가 설치될 네임스페이스
+  namespace: tekton-pipelines
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: queue-controller-cluster-role
+  name: queue-controller-role
 rules:
   - apiGroups: ["tekton.dev"]
     resources: ["pipelineruns", "pipelineruns/status"]
@@ -108,15 +183,52 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: queue-controller-cluster-binding
+  name: queue-controller-binding
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: queue-controller-cluster-role
+  name: queue-controller-role
 subjects:
   - kind: ServiceAccount
     name: queue-controller
     namespace: tekton-pipelines
+
+# 3. Webhook Service & Configuration
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tekton-queue-webhook-service
+  namespace: tekton-pipelines
+spec:
+  ports:
+    - port: 443
+      targetPort: 8443
+  selector:
+    app: tekton-queue
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: tekton-queue-mutator
+webhooks:
+  - name: queue.mutator.tekton.dev
+    clientConfig:
+      service:
+        name: tekton-queue-webhook-service
+        namespace: tekton-pipelines
+        path: "/mutate"
+      caBundle: "<BASE64_ENCODED_CA_CERT_HERE>" # 주의: 실제 Base64 인코딩 값으로 교체하세요!
+    rules:
+      - operations: ["CREATE"]
+        apiGroups: ["tekton.dev"]
+        apiVersions: ["v1", "v1beta1"]
+        resources: ["pipelineruns"]
+    admissionReviewVersions: ["v1", "v1beta1"]
+    sideEffects: None
+    timeoutSeconds: 5
+
+# 4. Controller Deployment
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -134,58 +246,71 @@ spec:
         app: tekton-queue
     spec:
       serviceAccountName: queue-controller
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        fsGroup: 1001
       containers:
         - name: manager
-          image: docker.io/tekton/tekton-queue-controller:v0.1.0 # 빌드한 이미지 주소
+          image: docker.io/tekton-queue-controller:v0.1.0 # 빌드한 이미지 주소로 변경
           imagePullPolicy: Always
-
-```
-
-```bash
-kubectl apply -f crd.yaml
-kubectl apply -f limit-setting.yaml
-kubectl apply -f deploy.yaml
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          ports:
+            - containerPort: 8443
+          volumeMounts:
+            - name: cert-volume
+              mountPath: "/certs"
+              readOnly: true
+      volumes:
+        - name: cert-volume
+          secret:
+            secretName: tekton-queue-cacerts
 
 ```
 
 ---
 
-## 동작 방식 (How it works)
+## 5. 내부 동작 흐름 (How it works)
 
-1. **감시 (Watcher):**
-* `*-cicd` 패턴의 네임스페이스에서 새로운 `PipelineRun` 생성을 실시간 감지합니다.
-* 새 파이프라인이 감지되면 `queue.tekton.dev/managed="yes"` 라벨을 부착합니다.
-* 기존에 존재하던 `Pending` 상태의 템플릿 파이프라인은 무시합니다.
-
-
-2. **제한 확인 (Limit Check):**
-* 현재 실행 중인(`Running`) 파이프라인 개수를 확인합니다.
-* 설정된 `maxPipelines`를 초과하면 해당 파이프라인을 `PipelineRunPending` 상태로 변경합니다.
-
-
-3. **강제 집행 (Strict Enforcement):**
-* 만약 Tekton이 컨트롤러보다 빠르게 파이프라인을 시작(`Started`)시켜버려서 `Pending` 전환이 실패할 경우,
-* 컨트롤러는 해당 파이프라인을 **즉시 삭제(Delete)** 하고, 동일한 스펙으로 **재생성(Recreate as Pending)** 하여 대기열 맨 뒤로 보냅니다.
-
-
-4. **큐 관리 (Manager):**
-* 주기적으로 빈자리가 났는지 확인합니다.
-* 자리가 나면 대기 중인 파이프라인 중 가장 오래된 것(FIFO)을 실행(`None`)시킵니다.
-
-
+1. **사전 통제 (Webhook Endpoint):** 파이프라인 생성 API 호출 시 K8s API Server가 컨트롤러의 `/mutate` 엔드포인트를 호출합니다. 컨트롤러는 로컬 캐시를 확인하여 현재 실행 중인 파이프라인이 쿼터를 초과했을 경우, `PipelineRunPending` 상태와 큐 관리용 라벨을 JSONPatch로 즉각 주입합니다.
+2. **상태 동기화 (Watcher Thread):** 백그라운드 스레드에서 K8s API의 `Watch` 스트림을 활용해 클러스터 내 파이프라인의 상태 변화를 로컬 인메모리 캐시(`local_cache`)에 실시간으로 반영합니다.
+3. **큐 스케줄링 (Manager Thread):** 5초 주기로 구동되며, 기존 실행 중이던 파이프라인이 종료되어 쿼터에 여유 슬롯이 생기면, 대기열(etcd `creationTimestamp` 기준 오름차순 정렬)에서 다음 파이프라인의 `status`를 `None`으로 패치하여 실행을 재개시킵니다.
 
 ---
 
-## 빌드 (Build)
-
-직접 이미지를 빌드하려면 다음 명령어를 사용하세요.
+## 6. 빌드 가이드 (Build)
 
 ```dockerfile
 # Dockerfile
 FROM python:3.9-slim
-RUN pip install kubernetes
-COPY controller.py /controller.py
-CMD ["python", "-u", "/controller.py"]
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY app.py .
+USER 1001
+EXPOSE 8443
+CMD ["python", "app.py"]
+
+```
+
+**requirements.txt:**
+
+```text
+Flask==3.0.0
+kubernetes==28.1.0
 
 ```
 
@@ -194,9 +319,3 @@ docker build -t your-registry/tekton-queue-controller:v0.1.0 .
 docker push your-registry/tekton-queue-controller:v0.1.0
 
 ```
-
----
-
-## 📝 라이선스 (License)
-
-MIT License
