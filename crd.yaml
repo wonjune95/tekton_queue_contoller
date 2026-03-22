@@ -7,6 +7,9 @@ spec:
   names:
     kind: GlobalLimit
     plural: globallimits
+    singular: globallimit
+    shortNames:
+      - gl
   scope: Cluster
   versions:
     - name: v1
@@ -18,6 +21,55 @@ spec:
           properties:
             spec:
               type: object
+              required:
+                - maxPipelines
               properties:
                 maxPipelines:
                   type: integer
+                  description: "동시 실행 가능한 최대 파이프라인 수"
+                agingIntervalSec:
+                  type: integer
+                  default: 180
+                  description: "에이징 승격 주기 (초)"
+                agingMinTier:
+                  type: integer
+                  default: 1
+                  description: "에이징으로 도달 가능한 최소 Tier (0은 긴급 전용)"
+                tierRules:
+                  type: array
+                  description: "티어 분류 규칙. 순서대로 매칭되며 먼저 매칭된 규칙이 적용된다."
+                  items:
+                    type: object
+                    required:
+                      - tier
+                      - matchType
+                      - pattern
+                    properties:
+                      tier:
+                        type: integer
+                        description: "매칭 시 부여할 Tier (0이 최우선)"
+                      matchType:
+                        type: string
+                        enum:
+                          - label
+                          - env
+                        description: "매칭 대상. label: 지정된 labelKey의 값, env: metadata.labels.env 값"
+                      labelKey:
+                        type: string
+                        description: "matchType이 label일 때 매칭할 라벨 키"
+                      pattern:
+                        type: string
+                        description: "매칭 패턴 (fnmatch 문법: *, ?, [seq])"
+                      description:
+                        type: string
+                        description: "규칙 설명"
+      additionalPrinterColumns:
+        - name: MaxPipelines
+          type: integer
+          jsonPath: .spec.maxPipelines
+        - name: AgingInterval
+          type: integer
+          jsonPath: .spec.agingIntervalSec
+        - name: MinTier
+          type: integer
+          jsonPath: .spec.agingMinTier

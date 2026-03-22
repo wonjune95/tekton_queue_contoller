@@ -108,6 +108,20 @@ spec:
               cpu: "500m"
           ports:
             - containerPort: 8443
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8443
+              scheme: HTTPS
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8443
+              scheme: HTTPS
+            initialDelaySeconds: 5
+            periodSeconds: 10
           volumeMounts:
             - name: cert-volume
               mountPath: "/certs"

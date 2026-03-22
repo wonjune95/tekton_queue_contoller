@@ -20,7 +20,7 @@ metadata:
 subjects:
 - kind: ServiceAccount
   name: tekton-dashboard           # 설치된 대시보드의 실제 ServiceAccount
-  namespace: tekton-pipeline       # 대시보드가 설치된 네임스페이스
+  namespace: tekton-pipelines      # 대시보드가 설치된 네임스페이스
 roleRef:
   kind: ClusterRole
   name: tekton-dashboard-globallimit-viewer

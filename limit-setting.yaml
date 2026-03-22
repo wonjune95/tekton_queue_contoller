@@ -3,4 +3,35 @@ kind: GlobalLimit
 metadata:
   name: tekton-queue-limit
 spec:
-  maxPipelines: 10      # 큐잉 갯수
+  maxPipelines: 10
+  agingIntervalSec: 180
+  agingMinTier: 1
+  tierRules:
+    # -------------------------------------------------------
+    # 1순위: 긴급 라벨 (수동 실행 시 라벨을 직접 부여)
+    #   kubectl create 시 labels에 queue.tekton.dev/urgent: "true" 추가
+    # -------------------------------------------------------
+    - tier: 0
+      matchType: label
+      labelKey: "queue.tekton.dev/urgent"
+      pattern: "true"
+      description: "긴급 배포 (수동 실행)"
+    # -------------------------------------------------------
+    # 2순위: 환경 기반 (자동 트리거 - 빌드/배포 공통)
+    #   PipelineRun의 metadata.labels.env 값으로 분류
+    # -------------------------------------------------------
+    - tier: 1
+      matchType: env
+      pattern: "prod"
+      description: "운영 배포"
+    - tier: 2
+      matchType: env
+      pattern: "stg"
+      description: "검증 배포"
+    # -------------------------------------------------------
+    # 기본값: 위 규칙에 매칭되지 않은 모든 요청
+    # -------------------------------------------------------
+    - tier: 3
+      matchType: env
+      pattern: "*"
+      description: "개발 (기본값)"
