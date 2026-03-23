@@ -20,7 +20,7 @@ DEFAULT_AGING_MIN_TIER = 1
 DEFAULT_TIER = 3
 DEFAULT_TIER_RULES = [
     {"tier": 0, "matchType": "label", "labelKey": "queue.tekton.dev/urgent", "pattern": "true", "description": "긴급 배포 (수동 실행)"},
-    {"tier": 1, "matchType": "env", "pattern": "prod", "description": "운영 배포"},
+    {"tier": 1, "matchType": "env", "pattern": "prd", "description": "운영 배포"},
     {"tier": 2, "matchType": "env", "pattern": "stg", "description": "검증 배포"},
     {"tier": 3, "matchType": "env", "pattern": "*",   "description": "개발 (기본값)"},
 ]
@@ -58,6 +58,13 @@ crd_config_lock = threading.Lock()
 # ---------------------------------------------------------
 webhook_admitted_count = 0
 admitted_lock = threading.Lock()
+
+# ---------------------------------------------------------
+# [초기 동기화 플래그]
+# Watcher의 최초 list 동기화가 완료되기 전까지 Webhook 트래픽을 차단한다.
+# 불완전한 캐시로 인한 쿼터 초과 통과를 방지한다.
+# ---------------------------------------------------------
+initial_sync_done = False
 
 try:
     config.load_incluster_config()
@@ -286,12 +293,11 @@ def healthz():
 
 @app.route('/readyz', methods=['GET'])
 def readyz():
+    if not initial_sync_done:
+        return jsonify({"status": "not_ready", "reason": "initial sync not complete"}), 503
     with cache_lock:
         cache_size = len(local_cache)
-    if cache_size > 0:
-        return jsonify({"status": "ready", "cached_resources": cache_size}), 200
-    else:
-        return jsonify({"status": "not_ready", "reason": "cache not synced"}), 503
+    return jsonify({"status": "ready", "cached_resources": cache_size}), 200
 
 # ---------------------------------------------------------
 # [Webhook 통제 로직]
@@ -463,7 +469,7 @@ def manager_loop():
         time.sleep(5)
 
 def watcher_loop():
-    global webhook_admitted_count
+    global webhook_admitted_count, initial_sync_done
     log("[Watcher] 스레드 시작 (Informer 동기화)")
     resource_version = None
     while True:
@@ -486,6 +492,11 @@ def watcher_loop():
                     local_cache.update(new_cache)
                 with admitted_lock:
                     webhook_admitted_count = 0
+
+                # 초기 동기화 완료 → Webhook 트래픽 수신 허용
+                if not initial_sync_done:
+                    initial_sync_done = True
+                    log("초기 동기화 완료. Webhook 트래픽 수신을 시작합니다.")
 
                 log(f"동기화 완료 (현재 추적 중인 리소스: {len(local_cache)}개)")
 
