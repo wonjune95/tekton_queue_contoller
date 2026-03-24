@@ -180,7 +180,6 @@ apiVersion: tekton.devops/v1
 kind: GlobalLimit
 metadata:
   name: tekton-queue-limit
-  namespace: tekton-pipelines
 spec:
   maxPipelines: 10
   agingIntervalSec: 180
