@@ -1,0 +1,96 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "title": "Running Pipelines",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 8, "x": 0, "y": 0 },
+      "targets": [
+        { "expr": "tekton_queue_running_total", "legendFormat": "Running" }
+      ],
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] } }
+      }
+    },
+    {
+      "title": "Pending Pipelines",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 8, "x": 8, "y": 0 },
+      "targets": [
+        { "expr": "sum(tekton_queue_pending_total)", "legendFormat": "Pending" }
+      ],
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "orange", "value": null } ] } }
+      }
+    },
+    {
+      "title": "Max Limit",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 8, "x": 16, "y": 0 },
+      "targets": [
+        { "expr": "tekton_queue_limit", "legendFormat": "Limit" }
+      ],
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null } ] } }
+      }
+    },
+    {
+      "title": "Queue Status (Running vs Pending vs Limit)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 4 },
+      "targets": [
+        { "expr": "tekton_queue_running_total", "legendFormat": "Running" },
+        { "expr": "sum(tekton_queue_pending_total)", "legendFormat": "Pending (Total)" },
+        { "expr": "tekton_queue_limit", "legendFormat": "Limit" }
+      ],
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 10, "lineWidth": 2 } }
+      }
+    },
+    {
+      "title": "Pending by Tier",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "targets": [
+        { "expr": "tekton_queue_pending_total", "legendFormat": "Tier {{tier}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "custom": { "fillOpacity": 10, "lineWidth": 2, "stacking": { "mode": "normal", "group": "A" } } }
+      }
+    },
+    {
+      "title": "Scheduling Rate (5m avg)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "targets": [
+        { "expr": "sum(rate(tekton_queue_scheduled_total[5m])) or vector(0)", "legendFormat": "Scheduled/sec" },
+        { "expr": "sum(rate(tekton_queue_webhook_admitted_total[5m])) or vector(0)", "legendFormat": "Admitted Directly/sec" },
+        { "expr": "sum(rate(tekton_queue_webhook_queued_total[5m])) or vector(0)", "legendFormat": "Queued/sec" }
+      ]
+    },
+    {
+      "title": "K8s API Errors (last 1h)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 24, "x": 0, "y": 20 },
+      "targets": [
+        { "expr": "sum(increase(tekton_queue_kubernetes_api_errors_total[1h])) or vector(0)", "legendFormat": "Errors" }
+      ]
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["tekton", "queue"],
+  "templating": { "list": [] },
+  "time": { "from": "now-6h", "to": "now" },
+  "timezone": "browser",
+  "title": "Tekton Queue Controller Dashboard",
+  "version": 2
+}

@@ -5,7 +5,7 @@ metadata:
   namespace: tekton-pipelines
 spec:
   maxPipelines: 10
-  agingIntervalSec: 180
+  agingIntervalSec: 300
   agingMinTier: 1
   tierRules:
     # -------------------------------------------------------

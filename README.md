@@ -13,6 +13,7 @@ Tekton Pipelines는 클러스터 전체 단위의 동시 실행 개수를 제한
 3. **멀티 네임스페이스 지원:** 특정 패턴(예: `*-cicd`)을 가진 여러 네임스페이스를 단일 컨트롤러에서 통합 관리합니다.
 4. **API Server 부하 최소화:** `SharedInformer` 패턴의 로컬 인메모리 캐시를 조회하여 Admission 판정을 수행합니다.
 5. **결함 허용성 (Fault Tolerance):** 대기열 순서를 etcd의 `creationTimestamp` 기준으로 정렬하여, Controller Pod 재시작 시에도 순서가 보장됩니다.
+6. **모니터링 (Monitoring):** 프로메테우스 메트릭 노출(`/metrics`)을 통해 큐 트래픽과 스케줄링 통계를 그라파나 등에서 실시간 시각화할 수 있습니다.
 
 ---
 
@@ -27,6 +28,7 @@ Tekton Pipelines는 클러스터 전체 단위의 동시 실행 개수를 제한
 | **대기열 정합성** | `creationTimestamp` 기준 정렬 (FIFO) | Pod 재시작 시 순서 보장 |
 | **취소/중지 처리** | `Cancelled`, `CancelledRunFinally`, `StoppedRunFinally` 상태 감지 | 취소된 파이프라인의 슬롯 즉시 반환 |
 | **Race Condition 방어** | `webhook_admitted_count`로 Webhook-Watcher 간 정합성 유지 | 동시 CREATE 시 쿼터 초과 방지 |
+| **모니터링 및 시각화** | Prometheus `/metrics` 엔드포인트 자동 노출 | Grafana 등으로 직관적인 대시보드 상태 모니터링 구성 지원 |
 
 ---
 
@@ -178,6 +180,7 @@ apiVersion: tekton.devops/v1
 kind: GlobalLimit
 metadata:
   name: tekton-queue-limit
+  namespace: tekton-pipelines
 spec:
   maxPipelines: 10
   agingIntervalSec: 180
@@ -375,7 +378,22 @@ spec:
 
 ---
 
-## 7. 빌드 가이드 (Build)
+## 7. 모니터링 연동 (Prometheus & Grafana)
+
+본 컨트롤러는 `prometheus-client` 패키지를 통해 포트 `8443` 경로 `/metrics`로 다양한 모니터링 지표를 제공합니다. 또한 K8s Service 매니페스트(`install/deploy.yaml`)에 어노테이션(`prometheus.io/scrape`)이 포함되어 있어, 클러스터 내의 프로메테우스가 이 지표를 자동 수집합니다.
+
+- **주요 수집 메트릭(Metrics)**:
+  - `tekton_queue_limit` (Gauge): 글로벌 동시 실행 허용량 (Limit)
+  - `tekton_queue_running_total` (Gauge): 현재 실행 중인 파이프라인 개수
+  - `tekton_queue_pending_total` (Gauge): 현재 대기열에 쌓인 파이프라인 개수 (우선순위 Tier별 구별)
+  - `tekton_queue_scheduled_total` (Counter): 매니저가 스케줄링하여 실행 인가 처리를 내린 로그 횟수
+
+- **그라파나 대시보드**:
+  동봉된 `install/grafana-dashboard.json`을 Grafana의 "Import" 메뉴로 등록하면 대기열 상황(Limit, Running, Pending)을 직관적으로 확인할 수 있는 스탯(Stat) 패널과 트렌드 분석 시계열 차트가 즉시 구성됩니다.
+
+---
+
+## 8. 빌드 가이드 (Build)
 
 ```dockerfile
 FROM python:3.9-slim
@@ -393,6 +411,7 @@ CMD ["python", "app.py"]
 ```text
 Flask==3.0.0
 kubernetes==28.1.0
+prometheus-client==0.19.0
 ```
 
 ```bash

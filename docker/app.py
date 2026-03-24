@@ -8,6 +8,7 @@ import logging
 from flask import Flask, request, jsonify
 from kubernetes import client, config, watch
 from kubernetes.client.rest import ApiException
+from prometheus_client import Gauge, Counter, generate_latest, REGISTRY
 
 # =========================================================
 # [설정 - 기본값]
@@ -65,6 +66,17 @@ admitted_lock = threading.Lock()
 # 불완전한 캐시로 인한 쿼터 초과 통과를 방지한다.
 # ---------------------------------------------------------
 initial_sync_done = False
+
+# ---------------------------------------------------------
+# [Prometheus Metrics]
+# ---------------------------------------------------------
+METRIC_QUEUE_LIMIT = Gauge('tekton_queue_limit', '최대 동시 실행 파이프라인 수')
+METRIC_QUEUE_RUNNING = Gauge('tekton_queue_running_total', '현재 실행 중인 파이프라인 수')
+METRIC_QUEUE_PENDING = Gauge('tekton_queue_pending_total', '대기열에 있는 파이프라인 수', ['tier'])
+METRIC_WEBHOOK_ADMITTED = Counter('tekton_queue_webhook_admitted_total', 'Webhook을 통해 즉시 실행이 허용된 횟수', ['tier'])
+METRIC_WEBHOOK_QUEUED = Counter('tekton_queue_webhook_queued_total', 'Webhook을 통해 대기열로 보내진 횟수', ['tier'])
+METRIC_SCHEDULED = Counter('tekton_queue_scheduled_total', 'Manager 루프에 의해 실행 상태로 스케줄링된 횟수', ['tier'])
+METRIC_API_ERRORS = Counter('tekton_queue_kubernetes_api_errors_total', 'Kubernetes API 에러 횟수', ['operation'])
 
 try:
     config.load_incluster_config()
@@ -130,6 +142,7 @@ def load_crd_config():
             crd_config.update(new_config)
         return new_config["max_pipelines"]
     except ApiException as e:
+        METRIC_API_ERRORS.labels(operation='get_crd').inc()
         log(f"[경고] GlobalLimit CRD 조회 실패 (API 에러 {e.status}): {e.reason}. 기본값 사용.")
         return DEFAULT_LIMIT
     except Exception as e:
@@ -285,7 +298,7 @@ def update_cache(event_type, obj):
                     webhook_admitted_count = max(0, webhook_admitted_count - 1)
 
 # ---------------------------------------------------------
-# [Health Check]
+# [Health Check & Metrics]
 # ---------------------------------------------------------
 @app.route('/healthz', methods=['GET'])
 def healthz():
@@ -298,6 +311,10 @@ def readyz():
     with cache_lock:
         cache_size = len(local_cache)
     return jsonify({"status": "ready", "cached_resources": cache_size}), 200
+
+@app.route('/metrics', methods=['GET'])
+def metrics():
+    return generate_latest(REGISTRY), 200, {'Content-Type': 'text/plain; charset=utf-8'}
 
 # ---------------------------------------------------------
 # [Webhook 통제 로직]
@@ -343,6 +360,7 @@ def mutate_pipelinerun():
     match_info = "urgent" if is_urgent else f"env:{env_val}"
 
     if effective_running >= limit:
+        METRIC_WEBHOOK_QUEUED.labels(tier=str(tier_val)).inc()
         # [대기열 전환]
         log(f"[Webhook 차단] {namespace}/{pr_name} ({ptype}/{match_info}, Tier {tier_val}) "
             f"-> 쿼터 초과(Running:{effective_running} >= Limit:{limit}). 대기열로 보냅니다.")
@@ -383,6 +401,8 @@ def mutate_pipelinerun():
     # [즉시 실행]
     with admitted_lock:
         webhook_admitted_count += 1
+
+    METRIC_WEBHOOK_ADMITTED.labels(tier=str(tier_val)).inc()
 
     log(f"[Webhook 통과] {namespace}/{pr_name} ({ptype}/{match_info}, Tier {tier_val}) "
         f"-> 즉시 실행 허용 (Running:{effective_running+1}/{limit})")
@@ -428,6 +448,19 @@ def manager_loop():
                 print_dashboard(limit, running, pending, cfg)
                 last_log_time = time.time()
 
+            # 업데이트 매트릭스
+            METRIC_QUEUE_LIMIT.set(limit)
+            METRIC_QUEUE_RUNNING.set(running)
+            
+            METRIC_QUEUE_PENDING.clear()
+            pending_by_tier = {}
+            for target in pending:
+                t_labels = target['metadata'].get('labels', {})
+                tier_val = t_labels.get(TIER_LABEL_KEY, str(DEFAULT_TIER))
+                pending_by_tier[tier_val] = pending_by_tier.get(tier_val, 0) + 1
+            for t_val, count in pending_by_tier.items():
+                METRIC_QUEUE_PENDING.labels(tier=str(t_val)).set(count)
+
             if running < limit and pending:
                 slots = limit - running
                 to_run = pending[:slots]
@@ -449,6 +482,7 @@ def manager_loop():
                             'tekton.dev', 'v1', t_ns, 'pipelineruns', t_name,
                             {'spec': {'status': None}}
                         )
+                        METRIC_SCHEDULED.labels(tier=str(tier_val)).inc()
                         log(f"[스케줄링 완료] {t_ns}/{t_name} ({ptype}/{env_val}, "
                             f"Tier {tier_val}, 대기시간: {int(wait_secs)}s) -> 실행 시작")
                         running += 1
@@ -460,6 +494,7 @@ def manager_loop():
                                 local_cache[key]['spec']['status'] = None
 
                     except ApiException as e:
+                        METRIC_API_ERRORS.labels(operation='patch_pipelinerun').inc()
                         log(f"[에러] 실행 패치 실패 ({t_ns}/{t_name}): "
                             f"API 에러 {e.status} - {e.reason}")
                     except Exception as e:
@@ -511,6 +546,7 @@ def watcher_loop():
                 resource_version = obj['metadata']['resourceVersion']
                 update_cache(etype, obj)
         except ApiException as e:
+            METRIC_API_ERRORS.labels(operation='watch_pipelinerun').inc()
             if e.status == 410:
                 log("[Watcher] resourceVersion 만료 (410 Gone). 전체 재동기화를 수행합니다.")
                 resource_version = None
@@ -519,6 +555,7 @@ def watcher_loop():
                     f"기존 위치에서 재연결 시도 중...")
             time.sleep(2)
         except Exception as e:
+            METRIC_API_ERRORS.labels(operation='watch_pipelinerun_stream').inc()
             log(f"[Watcher] 스트림 끊김, 재연결 시도 중... ({e})")
             resource_version = None
             time.sleep(2)

@@ -40,6 +40,11 @@ kind: Service
 metadata:
   name: tekton-queue-webhook-service
   namespace: tekton-pipelines
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/scheme: "https"
+    prometheus.io/path: "/metrics"
+    prometheus.io/port: "8443"
 spec:
   ports:
     - port: 443
