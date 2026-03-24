@@ -38,7 +38,7 @@ subjects:
 apiVersion: v1
 kind: Service
 metadata:
-  name: tekton-queue-webhook-service
+  name: tekton-queue-controller
   namespace: tekton-pipelines
   annotations:
     prometheus.io/scrape: "true"
@@ -47,8 +47,12 @@ metadata:
     prometheus.io/port: "8443"
 spec:
   ports:
-    - port: 443
+    - name: https
+      port: 443
       targetPort: 8443
+    - name: metrics
+      port: 9090
+      targetPort: 9090
   selector:
     app: tekton-queue
 ---
@@ -60,7 +64,7 @@ webhooks:
   - name: queue.mutator.tekton.dev
     clientConfig:
       service:
-        name: tekton-queue-webhook-service
+        name: tekton-queue-controller
         namespace: tekton-pipelines
         path: "/mutate"
       caBundle: "<BASE64_ENCODED_CA_CERT_HERE>" # 주의: 실제 Base64 인코딩 값으로 교체하세요!
