@@ -87,14 +87,14 @@ keyUsage = nonRepudiation, digitalSignature, keyEncipherment
 extendedKeyUsage = serverAuth
 subjectAltName = @alt_names
 [alt_names]
-DNS.1 = tekton-queue-webhook-service
-DNS.2 = tekton-queue-webhook-service.tekton-pipelines
-DNS.3 = tekton-queue-webhook-service.tekton-pipelines.svc
+DNS.1 = tekton-queue-controller
+DNS.2 = tekton-queue-controller.tekton-pipelines
+DNS.3 = tekton-queue-controller.tekton-pipelines.svc
 EOF
 
 openssl genrsa -out tls.key 2048
 openssl req -new -key tls.key -out tls.csr \
-  -subj "/CN=tekton-queue-webhook-service.tekton-pipelines.svc" \
+  -subj "/CN=tekton-queue-controller.tekton-pipelines.svc" \
   -config csr.conf
 openssl x509 -req -in tls.csr -signkey tls.key -out tls.crt \
   -days 3650 -extensions v3_req -extfile csr.conf
@@ -259,7 +259,7 @@ subjects:
 apiVersion: v1
 kind: Service
 metadata:
-  name: tekton-queue-webhook-service
+  name: tekton-queue-controller
   namespace: tekton-pipelines
 spec:
   ports:
@@ -276,7 +276,7 @@ webhooks:
   - name: queue.mutator.tekton.dev
     clientConfig:
       service:
-        name: tekton-queue-webhook-service
+        name: tekton-queue-controller
         namespace: tekton-pipelines
         path: "/mutate"
       caBundle: "<BASE64_ENCODED_CA_CERT_HERE>"
