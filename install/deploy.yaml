@@ -44,12 +44,15 @@ metadata:
     prometheus.io/scrape: "true"
     prometheus.io/scheme: "https"
     prometheus.io/path: "/metrics"
-    prometheus.io/port: "8443"
+    prometheus.io/port: "9090"
 spec:
   ports:
     - name: https
-      port: 443
+      port: 8443
       targetPort: 8443
+    - name: metrics
+      port: 9090
+      targetPort: 9090
   selector:
     app: tekton-queue
 ---

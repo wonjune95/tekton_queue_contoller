@@ -8,7 +8,7 @@ import logging
 from flask import Flask, request, jsonify
 from kubernetes import client, config, watch
 from kubernetes.client.rest import ApiException
-from prometheus_client import Gauge, Counter, generate_latest, REGISTRY
+from prometheus_client import Gauge, Counter, start_http_server
 
 # =========================================================
 # [설정 - 기본값]
@@ -312,9 +312,6 @@ def readyz():
         cache_size = len(local_cache)
     return jsonify({"status": "ready", "cached_resources": cache_size}), 200
 
-@app.route('/metrics', methods=['GET'])
-def metrics():
-    return generate_latest(REGISTRY), 200, {'Content-Type': 'text/plain; charset=utf-8'}
 
 # ---------------------------------------------------------
 # [Webhook 통제 로직]
@@ -578,6 +575,9 @@ if __name__ == "__main__":
         log(f"    Tier {rule['tier']} [{mt}{extra}] "
             f"{rule['pattern']} ({rule.get('description', '')})")
     log(f"  취소 상태 목록: {sorted(CANCEL_STATUSES)}")
+
+    start_http_server(9090)
+    log("Prometheus metrics server started on port 9090")
 
     threading.Thread(target=manager_loop, daemon=True).start()
     threading.Thread(target=watcher_loop, daemon=True).start()

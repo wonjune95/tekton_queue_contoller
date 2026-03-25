@@ -379,20 +379,17 @@ spec:
 
 ## 7. 모니터링 연동 (Prometheus & Grafana)
 
-본 컨트롤러는 `prometheus-client` 패키지를 통해 포트 `8443` 경로 `/metrics`로 다양한 모니터링 지표를 제공합니다. 또한 K8s Service 매니페스트(`install/deploy.yaml`)에 어노테이션(`prometheus.io/scrape`)이 포함되어 있어, 클러스터 내의 프로메테우스가 이 지표를 자동 수집합니다.
+본 컨트롤러는 `prometheus-client` 패키지를 통해 포트 `9090` 경로 `/metrics`로 다양한 모니터링 지표를 제공합니다. 또한 K8s Service 매니페스트(`install/deploy.yaml`)에 어노테이션(`prometheus.io/scrape`)이 포함되어 있어, 클러스터 내의 프로메테우스가 이 지표를 자동 수집합니다.
 
 - **Prometheus Scrape 설정 예시**:
-  Service Monitor나 Annotation 기반 자동 수집을 사용하지 않거나, HTTPS 설정 추가가 필요한 경우 프로메테우스 설정 파일(`prometheus.yml`)에 아래의 `scrape_configs`를 직접 추가하세요:
+  Service Monitor나 Annotation 기반 자동 수집을 사용하지 않는 경우 프로메테우스 설정 파일(`prometheus.yml`)에 아래의 `scrape_configs`를 직접 추가하세요 (이제 HTTPS나 TLS 설정 우회가 필요하지 않습니다):
 
 ```yaml
   scrape_configs:
     - job_name: tekton-queue-controller
-      scheme: https                     # 추가: HTTPS 프로토콜 사용
-      tls_config:                       # 추가: 자체 서명 인증서 무시
-        insecure_skip_verify: true      
       static_configs:
       - targets:
-        - tekton-queue-controller.tekton-pipelines.svc.cluster.local:8443
+        - tekton-queue-controller.tekton-pipelines.svc.cluster.local:9090
 ```
 
 - **주요 수집 메트릭(Metrics)**:
@@ -415,7 +412,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py .
 USER 1001
-EXPOSE 8443
+EXPOSE 8443 9090
 CMD ["python", "app.py"]
 ```
 
