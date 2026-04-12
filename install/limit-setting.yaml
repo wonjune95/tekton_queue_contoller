@@ -3,6 +3,8 @@ kind: GlobalLimit
 metadata:
   name: tekton-queue-limit
 spec:
+  namespacePatterns:
+    - "*-cicd"
   maxPipelines: 10
   agingIntervalSec: 300
   agingMinTier: 1

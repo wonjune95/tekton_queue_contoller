@@ -24,6 +24,11 @@ spec:
               required:
                 - maxPipelines
               properties:
+                namespacePatterns:
+                  type: array
+                  description: "관리 대상 네임스페이스 패턴 목록 (fnmatch 문법). 미설정 시 환경변수 사용."
+                  items:
+                    type: string
                 maxPipelines:
                   type: integer
                   description: "동시 실행 가능한 최대 파이프라인 수"
@@ -64,6 +69,9 @@ spec:
                         type: string
                         description: "규칙 설명"
       additionalPrinterColumns:
+        - name: Namespaces
+          type: string
+          jsonPath: .spec.namespacePatterns
         - name: MaxPipelines
           type: integer
           jsonPath: .spec.maxPipelines

@@ -1,3 +1,4 @@
+import os
 import time
 import threading
 import fnmatch
@@ -14,14 +15,16 @@ from prometheus_client import Gauge, Counter, start_http_server
 # [설정 - 기본값]
 # CRD에서 동적으로 읽어오며, CRD 조회 실패 시 아래 기본값을 사용한다.
 # =========================================================
-NAMESPACE_PATTERN = "*-cicd"
+# 네임스페이스 패턴: CRD spec.namespacePatterns에서 설정
+# CRD 미설정 또는 조회 실패 시 기본값 ["*-cicd"] 사용
+DEFAULT_NAMESPACE_PATTERNS = ["*-cicd"]
 DEFAULT_LIMIT = 10
 DEFAULT_AGING_INTERVAL_SEC = 180
 DEFAULT_AGING_MIN_TIER = 1
 DEFAULT_TIER = 3
 DEFAULT_TIER_RULES = [
     {"tier": 0, "matchType": "label", "labelKey": "queue.tekton.dev/urgent", "pattern": "true", "description": "긴급 배포 (수동 실행)"},
-    {"tier": 1, "matchType": "env", "pattern": "prd", "description": "운영 배포"},
+    {"tier": 1, "matchType": "env", "pattern": "prod", "description": "운영 배포"},
     {"tier": 2, "matchType": "env", "pattern": "stg", "description": "검증 배포"},
     {"tier": 3, "matchType": "env", "pattern": "*",   "description": "개발 (기본값)"},
 ]
@@ -51,6 +54,7 @@ crd_config = {
     "aging_interval_sec": DEFAULT_AGING_INTERVAL_SEC,
     "aging_min_tier": DEFAULT_AGING_MIN_TIER,
     "tier_rules": DEFAULT_TIER_RULES,
+    "namespace_patterns": list(DEFAULT_NAMESPACE_PATTERNS),
 }
 crd_config_lock = threading.Lock()
 
@@ -66,6 +70,21 @@ admitted_lock = threading.Lock()
 # 불완전한 캐시로 인한 쿼터 초과 통과를 방지한다.
 # ---------------------------------------------------------
 initial_sync_done = False
+
+# ---------------------------------------------------------
+# [Leader Election]
+# HA 구성에서 Manager 루프는 Leader Pod에서만 실행된다.
+# Webhook과 Watcher는 모든 Pod에서 독립적으로 동작한다.
+# ---------------------------------------------------------
+LEASE_NAME = os.environ.get("LEASE_NAME", "tekton-queue-controller-leader")
+LEASE_NAMESPACE = os.environ.get("POD_NAMESPACE", "tekton-pipelines")
+POD_NAME = os.environ.get("POD_NAME", f"controller-{os.getpid()}")
+LEASE_DURATION_SEC = 15
+LEASE_RENEW_DEADLINE_SEC = 10
+LEASE_RETRY_PERIOD_SEC = 2
+
+is_leader = False
+leader_lock = threading.Lock()
 
 # ---------------------------------------------------------
 # [Prometheus Metrics]
@@ -132,11 +151,20 @@ def load_crd_config():
             'tekton.devops', 'v1', 'globallimits', 'tekton-queue-limit'
         )
         spec = obj.get('spec', {})
+
+        # 네임스페이스 패턴: CRD에서 설정 (미설정 시 기본값 사용)
+        ns_patterns = spec.get('namespacePatterns')
+        if ns_patterns and isinstance(ns_patterns, list) and len(ns_patterns) > 0:
+            resolved_patterns = ns_patterns
+        else:
+            resolved_patterns = list(DEFAULT_NAMESPACE_PATTERNS)
+
         new_config = {
             "max_pipelines": int(spec.get('maxPipelines', DEFAULT_LIMIT)),
             "aging_interval_sec": int(spec.get('agingIntervalSec', DEFAULT_AGING_INTERVAL_SEC)),
             "aging_min_tier": int(spec.get('agingMinTier', DEFAULT_AGING_MIN_TIER)),
             "tier_rules": spec.get('tierRules', DEFAULT_TIER_RULES),
+            "namespace_patterns": resolved_patterns,
         }
         with crd_config_lock:
             crd_config.update(new_config)
@@ -226,7 +254,12 @@ def print_dashboard(limit, running_cnt, pending_list, cfg):
     log("=" * 60)
 
 def is_target_namespace(namespace):
-    return fnmatch.fnmatch(namespace, NAMESPACE_PATTERN)
+    """주어진 네임스페이스가 관리 대상인지 패턴 매칭으로 확인한다.
+    CRD 또는 환경변수에서 설정된 복수 패턴 중 하나라도 매칭되면 True.
+    """
+    cfg = get_cached_config()
+    patterns = cfg.get("namespace_patterns", DEFAULT_NAMESPACE_PATTERNS)
+    return any(fnmatch.fnmatch(namespace, p) for p in patterns)
 
 # ---------------------------------------------------------
 # [큐 상태 조회]
@@ -302,7 +335,13 @@ def update_cache(event_type, obj):
 # ---------------------------------------------------------
 @app.route('/healthz', methods=['GET'])
 def healthz():
-    return jsonify({"status": "ok"}), 200
+    with leader_lock:
+        leader_status = is_leader
+    return jsonify({
+        "status": "ok",
+        "leader": leader_status,
+        "pod": POD_NAME,
+    }), 200
 
 @app.route('/readyz', methods=['GET'])
 def readyz():
@@ -310,7 +349,14 @@ def readyz():
         return jsonify({"status": "not_ready", "reason": "initial sync not complete"}), 503
     with cache_lock:
         cache_size = len(local_cache)
-    return jsonify({"status": "ready", "cached_resources": cache_size}), 200
+    with leader_lock:
+        leader_status = is_leader
+    return jsonify({
+        "status": "ready",
+        "cached_resources": cache_size,
+        "leader": leader_status,
+        "pod": POD_NAME,
+    }), 200
 
 
 # ---------------------------------------------------------
@@ -429,6 +475,95 @@ def mutate_pipelinerun():
     })
 
 # ---------------------------------------------------------
+# [Leader Election 루프]
+# Kubernetes Lease 리소스를 사용하여 Leader를 선출한다.
+# Leader만 Manager 스케줄링 루프를 실행한다.
+# ---------------------------------------------------------
+def leader_election_loop():
+    global is_leader
+    coord_api = client.CoordinationV1Api()
+    log(f"[LeaderElection] 시작 (Pod: {POD_NAME}, Lease: {LEASE_NAMESPACE}/{LEASE_NAME})")
+
+    while True:
+        try:
+            now = datetime.datetime.now(datetime.timezone.utc)
+
+            # Lease 조회 시도
+            try:
+                lease = coord_api.read_namespaced_lease(LEASE_NAME, LEASE_NAMESPACE)
+            except ApiException as e:
+                if e.status == 404:
+                    # Lease가 없으면 새로 생성하여 Leader 획득
+                    lease_body = client.V1Lease(
+                        metadata=client.V1ObjectMeta(
+                            name=LEASE_NAME,
+                            namespace=LEASE_NAMESPACE,
+                        ),
+                        spec=client.V1LeaseSpec(
+                            holder_identity=POD_NAME,
+                            lease_duration_seconds=LEASE_DURATION_SEC,
+                            acquire_time=now,
+                            renew_time=now,
+                        ),
+                    )
+                    coord_api.create_namespaced_lease(LEASE_NAMESPACE, lease_body)
+                    with leader_lock:
+                        if not is_leader:
+                            is_leader = True
+                            log(f"[LeaderElection] Leader 획득 (신규 Lease 생성)")
+                    time.sleep(LEASE_RETRY_PERIOD_SEC)
+                    continue
+                else:
+                    raise
+
+            # 현재 Lease 상태 확인
+            holder = lease.spec.holder_identity
+            renew_time = lease.spec.renew_time
+            duration = lease.spec.lease_duration_seconds or LEASE_DURATION_SEC
+
+            if holder == POD_NAME:
+                # 내가 Leader → 갱신
+                lease.spec.renew_time = now
+                coord_api.replace_namespaced_lease(LEASE_NAME, LEASE_NAMESPACE, lease)
+                with leader_lock:
+                    if not is_leader:
+                        is_leader = True
+                        log(f"[LeaderElection] Leader 재획득 (갱신 성공)")
+            elif renew_time is None or (now - renew_time).total_seconds() > duration:
+                # 기존 Leader의 Lease가 만료됨 → 탈취 시도
+                lease.spec.holder_identity = POD_NAME
+                lease.spec.acquire_time = now
+                lease.spec.renew_time = now
+                lease.spec.lease_duration_seconds = LEASE_DURATION_SEC
+                coord_api.replace_namespaced_lease(LEASE_NAME, LEASE_NAMESPACE, lease)
+                with leader_lock:
+                    was_leader = is_leader
+                    is_leader = True
+                if not was_leader:
+                    # 새로 Leader가 되면 admitted count 초기화
+                    with admitted_lock:
+                        webhook_admitted_count = 0
+                    log(f"[LeaderElection] Leader 승격 (이전 Leader: {holder}, Lease 만료)")
+            else:
+                # 다른 Pod가 Leader → 대기
+                with leader_lock:
+                    if is_leader:
+                        is_leader = False
+                        log(f"[LeaderElection] Leader 해제 (현재 Leader: {holder})")
+
+        except ApiException as e:
+            METRIC_API_ERRORS.labels(operation='leader_election').inc()
+            if e.status == 409:
+                # Conflict → 다른 Pod가 먼저 업데이트함
+                log(f"[LeaderElection] Lease 충돌 (409 Conflict). 다음 주기에 재시도.")
+            else:
+                log(f"[LeaderElection] API 에러 ({e.status}): {e.reason}")
+        except Exception as e:
+            log(f"[LeaderElection] 에러: {e}")
+
+        time.sleep(LEASE_RETRY_PERIOD_SEC)
+
+# ---------------------------------------------------------
 # [Manager & Watcher 루프]
 # ---------------------------------------------------------
 def manager_loop():
@@ -437,6 +572,13 @@ def manager_loop():
 
     while True:
         try:
+            # Leader가 아니면 스케줄링을 수행하지 않는다
+            with leader_lock:
+                currently_leader = is_leader
+            if not currently_leader:
+                time.sleep(5)
+                continue
+
             limit = load_crd_config()
             cfg = get_cached_config()
             running, pending = get_queue_status_from_cache()
@@ -562,10 +704,11 @@ def watcher_loop():
 # ---------------------------------------------------------
 if __name__ == "__main__":
     log("Tekton Queue Controller 기동 준비 중...")
-    log(f"  네임스페이스 패턴: {NAMESPACE_PATTERN}")
+    log(f"  Pod: {POD_NAME}")
 
     initial_limit = load_crd_config()
     cfg = get_cached_config()
+    log(f"  네임스페이스 패턴: {cfg['namespace_patterns']}")
     log(f"  Limit: {cfg['max_pipelines']}")
     log(f"  Aging: {cfg['aging_interval_sec']}초당 Tier 1 승격 (최소 Tier {cfg['aging_min_tier']})")
     log(f"  Tier Rules:")
@@ -575,10 +718,13 @@ if __name__ == "__main__":
         log(f"    Tier {rule['tier']} [{mt}{extra}] "
             f"{rule['pattern']} ({rule.get('description', '')})")
     log(f"  취소 상태 목록: {sorted(CANCEL_STATUSES)}")
+    log(f"  Leader Election: Lease={LEASE_NAMESPACE}/{LEASE_NAME}, "
+        f"Duration={LEASE_DURATION_SEC}s, Renew={LEASE_RENEW_DEADLINE_SEC}s")
 
     start_http_server(9090)
     log("Prometheus metrics server started on port 9090")
 
+    threading.Thread(target=leader_election_loop, daemon=True).start()
     threading.Thread(target=manager_loop, daemon=True).start()
     threading.Thread(target=watcher_loop, daemon=True).start()
 

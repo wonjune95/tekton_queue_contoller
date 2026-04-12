@@ -2,58 +2,174 @@
 
 다수의 네임스페이스에 걸쳐 실행되는 Tekton PipelineRun의 **전역 동시 실행 개수(Global Concurrency Limits)**를 통제하고, **우선순위 기반 스케줄링**을 제공하는 Kubernetes Mutating Admission Webhook 컨트롤러입니다.
 
-## 1. 개요 (Overview)
+---
+
+## 1. 개요
 
 Tekton Pipelines는 클러스터 전체 단위의 동시 실행 개수를 제한하는 기능을 포함하지 않습니다. 이로 인해 대규모 배포 요청이 동시에 발생하면 자원 경쟁으로 인한 OOM 및 노드 장애가 발생할 수 있습니다.
 
 본 컨트롤러는 **Kubernetes MutatingAdmissionWebhook**을 활용하여 API Server 인입 단계에서 파이프라인 생성 요청을 선제적으로 통제하며, 다음의 기능을 제공합니다.
 
-1. **사전 차단 (Proactive Control):** 쿼터를 초과한 실행 요청에 `PipelineRunPending` 상태를 즉시 주입하여 자원 고갈을 원천 차단합니다.
-2. **우선순위 스케줄링:** CRD 기반의 티어 분류 규칙(label/env 매칭)을 통해 긴급 배포를 우선 처리하고, 에이징(Aging) 메커니즘으로 기아(Starvation) 현상을 방지합니다.
-3. **멀티 네임스페이스 지원:** 특정 패턴(예: `*-cicd`)을 가진 여러 네임스페이스를 단일 컨트롤러에서 통합 관리합니다.
-4. **API Server 부하 최소화:** `SharedInformer` 패턴의 로컬 인메모리 캐시를 조회하여 Admission 판정을 수행합니다.
-5. **결함 허용성 (Fault Tolerance):** 대기열 순서를 etcd의 `creationTimestamp` 기준으로 정렬하여, Controller Pod 재시작 시에도 순서가 보장됩니다.
-6. **모니터링 (Monitoring):** 프로메테우스 메트릭 노출(`/metrics`)을 통해 큐 트래픽과 스케줄링 통계를 그라파나 등에서 실시간 시각화할 수 있습니다.
+| 기능 | 설명 |
+|------|------|
+| **사전 차단** | 쿼터 초과 시 `PipelineRunPending` 상태를 즉시 주입하여 자원 고갈 원천 차단 |
+| **우선순위 스케줄링** | CRD 기반 티어 분류 + 에이징(Aging) 메커니즘으로 기아(Starvation) 방지 |
+| **멀티 네임스페이스** | 복수 패턴 기반 네임스페이스 필터링 (환경변수 / CRD 동적 설정) |
+| **고가용성 (HA)** | Kubernetes Lease 기반 Leader Election으로 다중 Pod 구성 지원 |
+| **API Server 부하 최소화** | SharedInformer 패턴의 로컬 인메모리 캐시 기반 Admission 판정 |
+| **결함 허용성** | etcd의 `creationTimestamp` 기준 정렬로 Pod 재시작 시에도 순서 보장 |
+| **모니터링** | Prometheus 메트릭 노출 + Grafana 대시보드 제공 |
 
 ---
 
-## 2. 아키텍처 설계 특징 (Architectural Features)
+## 2. 워크플로우
+
+### 2.1. 전체 동작 흐름
+
+```
+ 개발자/CI 트리거                  K8s API Server                  Queue Controller
+       │                              │                                │
+       │  PipelineRun CREATE 요청      │                                │
+       │─────────────────────────────▶│                                │
+       │                              │   /mutate Webhook 호출          │
+       │                              │───────────────────────────────▶│
+       │                              │                                │
+       │                              │                    ┌───────────┤
+       │                              │                    │ 캐시 조회   │
+       │                              │                    │ 쿼터 확인   │
+       │                              │                    │ 티어 분류   │
+       │                              │                    └───────────┤
+       │                              │                                │
+       │                              │   ┌────────────────────────────┤
+       │                              │   │                            │
+       │                              │   │ [쿼터 여유]                 │
+       │                              │   │  → 즉시 실행 허용            │
+       │                              │   │  → tier 라벨 부여            │
+       │                              │   │                            │
+       │                              │   │ [쿼터 초과]                 │
+       │                              │   │  → PipelineRunPending 주입  │
+       │                              │   │  → tier + managed 라벨 부여  │
+       │                              │   └────────────────────────────┤
+       │                              │                                │
+       │                              │◀──────── JSONPatch 응답 ────────│
+       │◀─────── PipelineRun 생성 ────│                                │
+       │                              │                                │
+```
+
+### 2.2. 대기열 스케줄링 흐름
+
+```
+   Manager Loop (5초 주기, Leader Pod에서만 실행)
+       │
+       ▼
+  ┌─────────────┐
+  │ CRD 설정 로드 │ ─── GlobalLimit CRD에서 Limit/Aging/TierRules/NamespacePatterns 읽기
+  └──────┬──────┘
+         ▼
+  ┌─────────────┐
+  │ 캐시에서 상태  │ ─── Running 카운트 + Managed Pending 목록 조회
+  │   조회       │
+  └──────┬──────┘
+         ▼
+  ┌─────────────┐     NO
+  │ Running     │──────────────────▶ (대기 5초 후 재확인)
+  │  < Limit ?  │
+  └──────┬──────┘
+         │ YES
+         ▼
+  ┌──────────────────┐
+  │ Pending 목록 정렬  │ ─── effective_tier(ASC) → creationTimestamp(FIFO)
+  │  + Aging 적용     │
+  └──────┬───────────┘
+         ▼
+  ┌─────────────┐
+  │ 빈 슬롯만큼   │ ─── spec.status = null 패치 → PipelineRun 실행 시작
+  │ 순서대로 실행  │
+  └─────────────┘
+```
+
+### 2.3. HA (Leader Election) 워크플로우
+
+```
+  ┌──────────────────────────────────────────────────────┐
+  │                  Kubernetes Cluster                   │
+  │                                                      │
+  │  ┌─────────────────┐     ┌─────────────────┐         │
+  │  │   Pod A (Leader) │     │ Pod B (Standby)  │         │
+  │  │                 │     │                 │         │
+  │  │  [Webhook]  ✅  │     │  [Webhook]  ✅  │         │
+  │  │  [Watcher]  ✅  │     │  [Watcher]  ✅  │         │
+  │  │  [Manager]  ✅  │     │  [Manager]  ⏸   │         │
+  │  │  [LeaderEl] ✅  │     │  [LeaderEl] ✅  │         │
+  │  │       │         │     │       │         │         │
+  │  └───────┼─────────┘     └───────┼─────────┘         │
+  │          │                       │                   │
+  │          ▼                       ▼                   │
+  │    ┌──────────────────────────────────┐               │
+  │    │        Lease 리소스 (etcd)        │               │
+  │    │  holder: pod-a                  │               │
+  │    │  renewTime: 2s 간격 갱신         │               │
+  │    │  leaseDuration: 15s             │               │
+  │    └──────────────────────────────────┘               │
+  └──────────────────────────────────────────────────────┘
+
+  [Failover 시나리오]
+  1. Pod A 장애 발생 → Lease 갱신 중단
+  2. Pod B가 2초 간격으로 Lease를 확인
+  3. renewTime으로부터 15초 경과 → Lease 만료 판정
+  4. Pod B가 Lease를 탈취하여 Leader로 승격
+  5. Manager 스케줄링 루프 자동 시작
+  6. webhook_admitted_count 초기화
+```
+
+| 역할 | Leader Pod | Standby Pod |
+|------|-----------|-------------|
+| Webhook `/mutate` | ✅ 처리 | ✅ 처리 (Service 라운드로빈) |
+| Watcher 캐시 동기화 | ✅ 실행 | ✅ 실행 (독립적) |
+| Manager 스케줄링 | ✅ **실행** | ❌ **대기** |
+| Leader Election | ✅ Lease 갱신 | ✅ Lease 감시 |
+
+---
+
+## 3. 아키텍처
 
 | 설계 항목 | 구현 방식 | 기대 효과 |
-| --- | --- | --- |
+|-----------|-----------|-----------|
 | **제어 시점** | K8s API Server 인입 시점 (Admission Phase) | 불필요한 이벤트 전파 방지 |
-| **초과 쿼터 처리** | `JSONPatch`를 통한 Pending 상태 + 티어 라벨 주입 | 강제 삭제/재생성 로직 제거 |
+| **초과 쿼터 처리** | JSONPatch를 통한 Pending 상태 + 티어 라벨 주입 | 강제 삭제/재생성 로직 제거 |
 | **우선순위 분류** | CRD `tierRules`에 의한 label/env 기반 자동 티어 부여 | 운영 정책 변경 시 코드 수정 불필요 |
 | **기아 방지** | 대기 시간 기반 에이징으로 effective tier 자동 승격 | 낮은 우선순위 파이프라인의 무기한 대기 방지 |
 | **대기열 정합성** | `creationTimestamp` 기준 정렬 (FIFO) | Pod 재시작 시 순서 보장 |
 | **취소/중지 처리** | `Cancelled`, `CancelledRunFinally`, `StoppedRunFinally` 상태 감지 | 취소된 파이프라인의 슬롯 즉시 반환 |
 | **Race Condition 방어** | `webhook_admitted_count`로 Webhook-Watcher 간 정합성 유지 | 동시 CREATE 시 쿼터 초과 방지 |
-| **모니터링 및 시각화** | Prometheus `/metrics` 엔드포인트 자동 노출 | Grafana 등으로 직관적인 대시보드 상태 모니터링 구성 지원 |
+| **고가용성** | Kubernetes Lease 기반 Leader Election | Leader 장애 시 ~15초 내 자동 Failover |
+| **네임스페이스 설정** | CRD `namespacePatterns` 동적 설정 (복수 패턴 지원) | 재배포 없이 대상 네임스페이스 변경 가능 |
+| **모니터링** | Prometheus `/metrics` 엔드포인트 자동 노출 | Grafana 대시보드로 실시간 시각화 |
 
 ---
 
-## 3. 우선순위 스케줄링 (Priority Scheduling)
+## 4. 우선순위 스케줄링
 
-### 3.1. 티어 분류 체계
+### 4.1. 티어 분류 체계
 
 GlobalLimit CRD의 `tierRules`를 통해 PipelineRun의 우선순위를 자동 분류합니다. 규칙은 순서대로 매칭되며, 먼저 매칭된 규칙이 적용됩니다.
 
 | 매칭 순서 | matchType | 매칭 대상 | 예시 | Tier |
-| --- | --- | --- | --- | --- |
+|-----------|-----------|-----------|------|------|
 | 1순위 | `label` | `metadata.labels`의 지정 키 | `queue.tekton.dev/urgent: "true"` | 0 (긴급) |
 | 2순위 | `env` | `metadata.labels.env` | `prod` | 1 (운영) |
 | 3순위 | `env` | `metadata.labels.env` | `stg` | 2 (검증) |
 | 기본값 | `env` | `metadata.labels.env` | `*` (나머지) | 3 (개발) |
 
-### 3.2. 에이징 (Aging) 메커니즘
+### 4.2. 에이징 (Aging) 메커니즘
 
 대기열에서 장시간 대기하는 파이프라인의 effective tier를 자동으로 승격시켜 기아 현상을 방지합니다.
 
-- **승격 주기:** `agingIntervalSec` (기본 180초)마다 effective tier가 1 감소
+- **승격 주기:** `agingIntervalSec` (기본 300초)마다 effective tier가 1 감소
 - **승격 하한:** `agingMinTier` (기본 1) 이하로는 내려가지 않음
 - **Tier 0 보호:** 에이징으로 Tier 0(긴급)에 도달할 수 없으므로, 수동 긴급 배포의 최우선 지위가 항상 보장됨
 
-### 3.3. 긴급 배포 사용 방법
+### 4.3. 긴급 배포 사용 방법
 
 PipelineRun을 수동으로 생성할 때 아래 라벨을 추가하면 Tier 0으로 분류됩니다.
 
@@ -65,15 +181,88 @@ metadata:
 
 ---
 
-## 4. 설치 및 배포 (Installation)
+## 5. 네임스페이스 설정
 
-### 4.1. 사전 요구사항
+컨트롤러가 관리할 네임스페이스를 GlobalLimit CRD의 `spec.namespacePatterns`에서 설정합니다. 복수 패턴을 지원하며, `fnmatch` 문법(`*`, `?`, `[seq]`)을 사용합니다.
 
-* Kubernetes Cluster (v1.20+)
-* Tekton Pipelines 설치 완료
-* OpenSSL (웹훅용 TLS 인증서 생성)
+CRD에 미설정 또는 조회 실패 시 기본값 `["*-cicd"]`가 사용됩니다.
 
-### 4.2. TLS 인증서 및 Secret 생성
+### 5.1. 설정 방법
+
+GlobalLimit CRD의 `spec.namespacePatterns`에 배열로 지정합니다. **재배포 없이 런타임에 변경 가능**합니다.
+
+```yaml
+apiVersion: tekton.devops/v1
+kind: GlobalLimit
+metadata:
+  name: tekton-queue-limit
+spec:
+  namespacePatterns:
+    - "*-cicd"
+    - "production-*"
+    - "staging-*"
+  maxPipelines: 10
+  # ...
+```
+
+```bash
+# 런타임 변경 예시
+kubectl patch globallimit tekton-queue-limit --type=merge \
+  -p '{"spec":{"namespacePatterns":["*-cicd","newapp-*"]}}'
+```
+
+### 5.2. 매칭 예시
+
+| 패턴 | 매칭되는 네임스페이스 | 매칭 안되는 네임스페이스 |
+|------|---------------------|----------------------|
+| `*-cicd` | `myapp-cicd`, `test-cicd` | `myapp-deploy`, `default` |
+| `tekton-*` | `tekton-pipelines`, `tekton-builds` | `my-tekton` |
+| `my-ns` | `my-ns` (정확 매칭) | `my-ns-extra` |
+| `prod-*` | `prod-api`, `prod-web` | `staging-api` |
+
+---
+
+## 6. 고가용성 (HA) 구성
+
+### 6.1. 개요
+
+Kubernetes Lease 기반 Leader Election으로 **다중 Pod(replicas ≥ 2)** 구성을 지원합니다. Leader Pod만 Manager 스케줄링 루프를 실행하고, Standby Pod는 Leader가 장애 시 자동으로 승격됩니다.
+
+### 6.2. Leader Election 파라미터
+
+| 파라미터 | 값 | 설명 |
+|---------|-----|------|
+| Lease Duration | 15초 | Lease 유효 기간 |
+| Retry Period | 2초 | Lease 체크/갱신 주기 |
+| 장애 복구 시간 | ~15초 | Leader 장애 시 Standby 승격까지 최대 시간 |
+
+### 6.3. Leader 상태 확인
+
+```bash
+# 특정 Pod의 Leader 상태 확인
+kubectl exec -n tekton-pipelines <pod-name> -- curl -sk https://localhost:8443/healthz
+# 응답 예시:
+# {"leader": true, "pod": "tekton-queue-controller-7f8b9c4d5-abc12", "status": "ok"}
+```
+
+### 6.4. Deployment 설정
+
+```yaml
+spec:
+  replicas: 2  # HA 기본 구성 (2~3 권장)
+```
+
+---
+
+## 7. 설치 및 배포
+
+### 7.1. 사전 요구사항
+
+- Kubernetes Cluster (v1.20+)
+- Tekton Pipelines 설치 완료
+- OpenSSL (웹훅용 TLS 인증서 생성)
+
+### 7.2. TLS 인증서 및 Secret 생성
 
 ```bash
 cat > csr.conf <<EOF
@@ -103,328 +292,135 @@ kubectl create secret tls tekton-queue-cacerts \
   --cert=tls.crt --key=tls.key -n tekton-pipelines
 ```
 
-### 4.3. CRD 및 GlobalLimit 설정
-
-```yaml
-# globallimit-crd.yaml
-apiVersion: apiextensions.k8s.io/v1
-kind: CustomResourceDefinition
-metadata:
-  name: globallimits.tekton.devops
-spec:
-  group: tekton.devops
-  names:
-    kind: GlobalLimit
-    plural: globallimits
-    singular: globallimit
-    shortNames:
-      - gl
-  scope: Cluster
-  versions:
-    - name: v1
-      served: true
-      storage: true
-      schema:
-        openAPIV3Schema:
-          type: object
-          properties:
-            spec:
-              type: object
-              required:
-                - maxPipelines
-              properties:
-                maxPipelines:
-                  type: integer
-                  description: "동시 실행 가능한 최대 파이프라인 수"
-                agingIntervalSec:
-                  type: integer
-                  default: 180
-                  description: "에이징 승격 주기 (초)"
-                agingMinTier:
-                  type: integer
-                  default: 1
-                  description: "에이징으로 도달 가능한 최소 Tier (0은 긴급 전용)"
-                tierRules:
-                  type: array
-                  description: "티어 분류 규칙 (순서대로 매칭)"
-                  items:
-                    type: object
-                    required:
-                      - tier
-                      - matchType
-                      - pattern
-                    properties:
-                      tier:
-                        type: integer
-                      matchType:
-                        type: string
-                        enum: [label, env]
-                      labelKey:
-                        type: string
-                      pattern:
-                        type: string
-                      description:
-                        type: string
-      additionalPrinterColumns:
-        - name: MaxPipelines
-          type: integer
-          jsonPath: .spec.maxPipelines
-        - name: AgingInterval
-          type: integer
-          jsonPath: .spec.agingIntervalSec
-        - name: MinTier
-          type: integer
-          jsonPath: .spec.agingMinTier
----
-apiVersion: tekton.devops/v1
-kind: GlobalLimit
-metadata:
-  name: tekton-queue-limit
-spec:
-  maxPipelines: 10
-  agingIntervalSec: 180
-  agingMinTier: 1
-  tierRules:
-    - tier: 0
-      matchType: label
-      labelKey: "queue.tekton.dev/urgent"
-      pattern: "true"
-      description: "긴급 배포 (수동 실행)"
-    - tier: 1
-      matchType: env
-      pattern: "prod"
-      description: "운영 배포"
-    - tier: 2
-      matchType: env
-      pattern: "stg"
-      description: "검증 배포"
-    - tier: 3
-      matchType: env
-      pattern: "*"
-      description: "개발 (기본값)"
-```
+### 7.3. 배포 순서
 
 ```bash
-kubectl apply -f globallimit-crd.yaml
+# 1. CRD 등록
+kubectl apply -f install/crd.yaml
+
+# 2. GlobalLimit 설정 (네임스페이스 패턴, 동시 실행 제한, 티어 규칙)
+kubectl apply -f install/limit-setting.yaml
+
+# 3. Controller 배포 (RBAC, Service, Webhook, Deployment)
+#    ⚠️ deploy.yaml의 caBundle을 실제 값으로 교체하세요:
+#    cat tls.crt | base64 | tr -d '\n'
+kubectl apply -f install/deploy.yaml
 ```
 
-### 4.4. 통합 배포 (Deploy)
+### 7.4. 배포 확인
 
-> **주의:** `caBundle` 필드는 `cat tls.crt | base64 | tr -d '\n'`으로 추출한 실제 값을 입력하세요.
+```bash
+# Pod 상태 확인 (HA면 2개 Pod가 Running이어야 함)
+kubectl get pods -n tekton-pipelines -l app=tekton-queue
+
+# GlobalLimit 설정 확인
+kubectl get globallimits
+
+# Leader 확인
+kubectl exec -n tekton-pipelines <pod-name> -- curl -sk https://localhost:8443/healthz
+```
+
+---
+
+## 8. 설정 참조
+
+### 8.1. GlobalLimit CRD 필드
+
+| 필드 | 타입 | 필수 | 기본값 | 설명 |
+|------|------|------|--------|------|
+| `spec.namespacePatterns` | `string[]` | ❌ | `["*-cicd"]` | 관리 대상 네임스페이스 패턴 목록 |
+| `spec.maxPipelines` | `integer` | ✅ | - | 동시 실행 가능한 최대 파이프라인 수 |
+| `spec.agingIntervalSec` | `integer` | ❌ | 300 | 에이징 승격 주기 (초) |
+| `spec.agingMinTier` | `integer` | ❌ | 1 | 에이징으로 도달 가능한 최소 Tier |
+| `spec.tierRules` | `object[]` | ❌ | 기본 규칙 | 티어 분류 규칙 배열 |
+
+### 8.2. 환경변수
+
+| 환경변수 | 기본값 | 설명 |
+|---------|--------|------|
+| `POD_NAME` | `controller-{PID}` | Pod 이름 (Leader Election용, Downward API로 주입) |
+| `POD_NAMESPACE` | `tekton-pipelines` | Pod 네임스페이스 (Lease 생성 위치) |
+| `LEASE_NAME` | `tekton-queue-controller-leader` | Leader Election Lease 리소스 이름 |
+
+### 8.3. 엔드포인트
+
+| 경로 | 포트 | 설명 |
+|------|------|------|
+| `/mutate` | 8443 (HTTPS) | Admission Webhook 엔드포인트 |
+| `/healthz` | 8443 (HTTPS) | Liveness Probe (leader 상태 포함) |
+| `/readyz` | 8443 (HTTPS) | Readiness Probe (초기 동기화 상태) |
+| `/metrics` | 9090 (HTTP) | Prometheus 메트릭 |
+
+---
+
+## 9. 모니터링 (Prometheus & Grafana)
+
+### 9.1. 메트릭 목록
+
+| 메트릭 | 타입 | 라벨 | 설명 |
+|--------|------|------|------|
+| `tekton_queue_limit` | Gauge | - | 글로벌 동시 실행 허용량 |
+| `tekton_queue_running_total` | Gauge | - | 현재 실행 중인 파이프라인 수 |
+| `tekton_queue_pending_total` | Gauge | `tier` | 대기열 파이프라인 수 (Tier별) |
+| `tekton_queue_webhook_admitted_total` | Counter | `tier` | Webhook 즉시 실행 허용 횟수 |
+| `tekton_queue_webhook_queued_total` | Counter | `tier` | Webhook 대기열 전환 횟수 |
+| `tekton_queue_scheduled_total` | Counter | `tier` | Manager 스케줄링 횟수 |
+| `tekton_queue_kubernetes_api_errors_total` | Counter | `operation` | K8s API 에러 횟수 |
+
+### 9.2. Prometheus Scrape 설정
 
 ```yaml
-# deploy.yaml
+scrape_configs:
+  - job_name: tekton-queue-controller
+    static_configs:
+      - targets:
+        - tekton-queue-controller.tekton-pipelines.svc.cluster.local:9090
+```
 
-# --- Controller RBAC ---
----
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: queue-controller
-  namespace: tekton-pipelines
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: queue-controller-role
-rules:
-  - apiGroups: ["tekton.dev"]
-    resources: ["pipelineruns", "pipelineruns/status"]
-    verbs: ["list", "watch", "get", "patch", "update", "delete", "create"]
-  - apiGroups: ["tekton.devops"]
-    resources: ["globallimits"]
-    verbs: ["list", "watch", "get"]
-  - apiGroups: [""]
-    resources: ["events", "namespaces"]
-    verbs: ["create", "list", "watch"]
-  - apiGroups: ["apiextensions.k8s.io"]
-    resources: ["customresourcedefinitions"]
-    verbs: ["list", "watch", "get"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: queue-controller-binding
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: queue-controller-role
-subjects:
-  - kind: ServiceAccount
-    name: queue-controller
-    namespace: tekton-pipelines
+### 9.3. Grafana 대시보드
 
-# --- Webhook Service & Configuration ---
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: tekton-queue-controller
-  namespace: tekton-pipelines
-spec:
-  ports:
-    - port: 443
-      targetPort: 8443
-  selector:
-    app: tekton-queue
----
-apiVersion: admissionregistration.k8s.io/v1
-kind: MutatingWebhookConfiguration
-metadata:
-  name: tekton-queue-mutator
-webhooks:
-  - name: queue.mutator.tekton.dev
-    clientConfig:
-      service:
-        name: tekton-queue-controller
-        namespace: tekton-pipelines
-        path: "/mutate"
-      caBundle: "<BASE64_ENCODED_CA_CERT_HERE>"
-    rules:
-      - operations: ["CREATE"]
-        apiGroups: ["tekton.dev"]
-        apiVersions: ["v1", "v1beta1"]
-        resources: ["pipelineruns"]
-    admissionReviewVersions: ["v1", "v1beta1"]
-    sideEffects: None
-    timeoutSeconds: 5
+`grafana-dashbaord/grafana-dashboard.json`을 Grafana의 "Import" 메뉴로 등록하면 큐 상태를 실시간으로 시각화할 수 있습니다.
 
-# --- Controller Deployment ---
 ---
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: tekton-queue-controller
-  namespace: tekton-pipelines
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: tekton-queue
-  template:
-    metadata:
-      labels:
-        app: tekton-queue
-    spec:
-      serviceAccountName: queue-controller
-      securityContext:
-        runAsNonRoot: true
-        runAsUser: 1001
-        fsGroup: 1001
-      containers:
-        - name: manager
-          image: docker.io/tekton-queue-controller:v0.2.0
-          imagePullPolicy: Always
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop: ["ALL"]
-            seccompProfile:
-              type: RuntimeDefault
-          resources:
-            requests:
-              memory: "128Mi"
-              cpu: "100m"
-            limits:
-              memory: "256Mi"
-              cpu: "500m"
-          ports:
-            - containerPort: 8443
-          livenessProbe:
-            httpGet:
-              path: /healthz
-              port: 8443
-              scheme: HTTPS
-            initialDelaySeconds: 10
-            periodSeconds: 15
-          readinessProbe:
-            httpGet:
-              path: /readyz
-              port: 8443
-              scheme: HTTPS
-            initialDelaySeconds: 5
-            periodSeconds: 10
-          volumeMounts:
-            - name: cert-volume
-              mountPath: "/certs"
-              readOnly: true
-      volumes:
-        - name: cert-volume
-          secret:
-            secretName: tekton-queue-cacerts
+
+## 10. 빌드 가이드
+
+```bash
+cd docker
+
+# 이미지 빌드
+docker build -t your-registry/tekton-queue-controller:v0.3.0 .
+
+# 이미지 푸시
+docker push your-registry/tekton-queue-controller:v0.3.0
 ```
 
 ---
 
-## 5. 내부 동작 흐름 (How it works)
+## 11. 프로젝트 구조
 
-1. **사전 통제 (Webhook):** PipelineRun 생성 요청 시 K8s API Server가 `/mutate` 엔드포인트를 호출합니다. 컨트롤러는 로컬 캐시를 확인하여 쿼터 초과 시 `PipelineRunPending` 상태, 관리 라벨(`queue.tekton.dev/managed`), 티어 라벨(`queue.tekton.dev/tier`)을 JSONPatch로 주입합니다. 티어는 CRD의 `tierRules`에 의해 자동 분류됩니다.
-
-2. **상태 동기화 (Watcher):** 백그라운드 스레드에서 K8s Watch 스트림으로 PipelineRun 상태 변화를 로컬 캐시에 실시간 반영합니다. `resourceVersion` 만료(410 Gone) 시 전체 재동기화를 수행하며, 일시적 API 에러 시에는 기존 위치에서 재연결을 시도합니다.
-
-3. **큐 스케줄링 (Manager):** 5초 주기로 구동되며, 빈 슬롯이 발생하면 대기열에서 우선순위 순으로 파이프라인을 꺼내 실행합니다. 정렬 기준은 effective tier(오름차순) → creationTimestamp(FIFO)이며, 에이징에 의해 장기 대기 파이프라인의 effective tier가 자동 승격됩니다.
-
-4. **취소/중지 처리:** `spec.status`가 `Cancelled`, `CancelledRunFinally`, `StoppedRunFinally`인 PipelineRun은 running/pending 카운트에서 즉시 제외되어 슬롯이 반환됩니다.
+```
+tekton_queue_controller/
+├── docker/
+│   ├── Dockerfile          # 컨테이너 이미지 빌드 파일
+│   ├── app.py              # 메인 컨트롤러 소스 코드
+│   └── requirements.txt    # Python 의존성
+├── install/
+│   ├── crd.yaml            # GlobalLimit CRD 스키마
+│   ├── deploy.yaml         # RBAC, Service, Webhook, Deployment
+│   ├── limit-setting.yaml  # GlobalLimit 설정 예시
+│   └── secret.yaml         # TLS Secret 템플릿
+├── grafana-dashbaord/
+│   └── grafana-dashboard.json  # Grafana 대시보드
+└── README.md
+```
 
 ---
 
-## 6. 설계 한계 및 향후 과제
+## 12. 설계 한계 및 향후 과제
 
 - **비선점형 설계:** Webhook 단계에서는 슬롯 가용 여부만 판단하며 우선순위를 고려하지 않습니다. 우선순위 정렬은 대기열 진입 이후 Manager에서 적용됩니다. 실행 중인 낮은 티어 파이프라인의 선점은 지원하지 않습니다.
 - **Webhook-Manager 경합:** 빌드 완료 후 트리거되는 배포 PipelineRun이 Webhook 경로로 슬롯을 먼저 차지하여, 대기열의 높은 우선순위 파이프라인보다 먼저 실행될 수 있습니다.
 - **`webhook_admitted_count` 정합성:** Webhook 통과 후 PipelineRun 생성 자체가 실패하면 카운터가 일시적으로 높게 유지됩니다. 전체 재동기화 시 리셋되어 최종 정합성이 보장됩니다.
 - **CRD 변경 반영 지연:** GlobalLimit CRD 변경 시 최대 5초의 반영 지연이 있습니다.
-
----
-
-## 7. 모니터링 연동 (Prometheus & Grafana)
-
-본 컨트롤러는 `prometheus-client` 패키지를 통해 포트 `9090` 경로 `/metrics`로 다양한 모니터링 지표를 제공합니다. 또한 K8s Service 매니페스트(`install/deploy.yaml`)에 어노테이션(`prometheus.io/scrape`)이 포함되어 있어, 클러스터 내의 프로메테우스가 이 지표를 자동 수집합니다.
-
-- **Prometheus Scrape 설정 예시**:
-  Service Monitor나 Annotation 기반 자동 수집을 사용하지 않는 경우 프로메테우스 설정 파일(`prometheus.yml`)에 아래의 `scrape_configs`를 직접 추가하세요 (이제 HTTPS나 TLS 설정 우회가 필요하지 않습니다):
-
-```yaml
-  scrape_configs:
-    - job_name: tekton-queue-controller
-      static_configs:
-      - targets:
-        - tekton-queue-controller.tekton-pipelines.svc.cluster.local:9090
-```
-
-- **주요 수집 메트릭(Metrics)**:
-  - `tekton_queue_limit` (Gauge): 글로벌 동시 실행 허용량 (Limit)
-  - `tekton_queue_running_total` (Gauge): 현재 실행 중인 파이프라인 개수
-  - `tekton_queue_pending_total` (Gauge): 현재 대기열에 쌓인 파이프라인 개수 (우선순위 Tier별 구별)
-  - `tekton_queue_scheduled_total` (Counter): 매니저가 스케줄링하여 실행 인가 처리를 내린 로그 횟수
-
-- **그라파나 대시보드**:
-  동봉된 `install/grafana-dashboard.json`을 Grafana의 "Import" 메뉴로 등록하면 대기열 상황(Limit, Running, Pending)을 직관적으로 확인할 수 있는 스탯(Stat) 패널과 트렌드 분석 시계열 차트가 즉시 구성됩니다.
-
----
-
-## 8. 빌드 가이드 (Build)
-
-```dockerfile
-FROM python:3.9-slim
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY app.py .
-USER 1001
-EXPOSE 8443 9090
-CMD ["python", "app.py"]
-```
-
-**requirements.txt:**
-
-```text
-Flask==3.0.0
-kubernetes==28.1.0
-prometheus-client==0.19.0
-```
-
-```bash
-docker build -t your-registry/tekton-queue-controller:v0.2.0 .
-docker push your-registry/tekton-queue-controller:v0.2.0
-```
+- **HA Failover 지연:** Leader 장애 시 최대 ~15초의 스케줄링 공백이 발생합니다. 이 동안 Webhook은 모든 Pod에서 정상 처리됩니다.
