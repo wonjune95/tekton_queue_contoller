@@ -163,7 +163,7 @@ def load_crd_config():
             "max_pipelines": int(spec.get('maxPipelines', DEFAULT_LIMIT)),
             "aging_interval_sec": int(spec.get('agingIntervalSec', DEFAULT_AGING_INTERVAL_SEC)),
             "aging_min_tier": int(spec.get('agingMinTier', DEFAULT_AGING_MIN_TIER)),
-            "tier_rules": spec.get('tierRules', DEFAULT_TIER_RULES),
+            "tier_rules": spec.get('tierRules') or DEFAULT_TIER_RULES,
             "namespace_patterns": resolved_patterns,
         }
         with crd_config_lock:
@@ -206,8 +206,11 @@ def determine_tier(labels, tier_rules):
                 return int(rule.get('tier', DEFAULT_TIER))
 
         elif match_type == 'env':
+            # Medium 3 Fix: env 라벨 없는 PR에서 `pattern: "*"` 와일드카드가 매칭 안 되는 문제.
+            # 기존: `if env_val and ...` → env 없으면 catch-all 규칙도 건너뜀
+            # 수정: fnmatch에 위임 (fnmatch('', '*') == True 이므로 의도대로 동작)
             env_val = labels.get(ENV_LABEL_KEY, '')
-            if env_val and fnmatch.fnmatch(env_val, pattern):
+            if fnmatch.fnmatch(env_val, pattern):
                 return int(rule.get('tier', DEFAULT_TIER))
 
     return DEFAULT_TIER
@@ -236,18 +239,24 @@ def print_dashboard(limit, running_cnt, pending_list, cfg):
         for idx, item in enumerate(pending_list[:5]):
             ns = item['metadata']['namespace']
             name = item['metadata'].get('name') or item['metadata'].get('generateName', '') + "(gen)"
-            labels = item['metadata'].get('labels', {})
+            labels = item['metadata'].get('labels') or {}
 
             original_tier = labels.get(TIER_LABEL_KEY, str(DEFAULT_TIER))
             creation_ts = item['metadata'].get('creationTimestamp', '')
             created_at = parse_k8s_timestamp(creation_ts)
             wait_secs = (now_utc - created_at).total_seconds()
             aging_bonus = int(wait_secs // aging_interval)
-            effective_tier = max(aging_min, int(original_tier) - aging_bonus)
-
             wait_display = f"{int(wait_secs)}s" if wait_secs < 120 else f"{int(wait_secs//60)}m"
             ptype = labels.get('type', '?')
             env_val = labels.get(ENV_LABEL_KEY, '?')
+
+            # Medium 2 Fix: tier 라벨 값이 오염된 경우 int() 변환 실패 방지
+            # High Fix: tier-0 urgent PR이 aging_min 바닥값으로 강등되지 않도록 min(tier,...) 적용
+            try:
+                tier_int = int(original_tier)
+                effective_tier = min(tier_int, max(aging_min, tier_int - aging_bonus))
+            except ValueError:
+                effective_tier = aging_min
 
             log(f"   {idx+1}. [Tier {original_tier}->{effective_tier}] "
                 f"{ns}/{name} ({ptype}/{env_val}, 대기: {wait_display})")
@@ -265,16 +274,19 @@ def is_target_namespace(namespace):
 # [큐 상태 조회]
 # ---------------------------------------------------------
 def get_queue_status_from_cache():
+    # Bug 4 Fix: cache_lock 밖에서 config를 미리 읽어
+    # cache_lock 내부에서 crd_config_lock 획득을 방지한다 (락 중첩 → 데드락 위험 제거)
     cfg = get_cached_config()
     aging_interval = cfg["aging_interval_sec"]
     aging_min = cfg["aging_min_tier"]
+    ns_patterns = cfg.get("namespace_patterns", DEFAULT_NAMESPACE_PATTERNS)
 
     running_cnt = 0
     managed_pending_list = []
     with cache_lock:
         for key, item in local_cache.items():
             ns = item['metadata']['namespace']
-            if not is_target_namespace(ns):
+            if not any(fnmatch.fnmatch(ns, p) for p in ns_patterns):
                 continue
             if is_pipelinerun_finished(item):
                 continue
@@ -284,14 +296,14 @@ def get_queue_status_from_cache():
             if spec_status != 'PipelineRunPending':
                 running_cnt += 1
             else:
-                labels = item['metadata'].get('labels', {})
+                labels = item['metadata'].get('labels') or {}
                 if labels.get(MANAGED_LABEL_KEY) == MANAGED_LABEL_VAL:
                     managed_pending_list.append(item)
 
     now_utc = datetime.datetime.now(datetime.timezone.utc)
 
     def get_priority_and_time(item):
-        labels = item['metadata'].get('labels', {})
+        labels = item['metadata'].get('labels') or {}
         tier_str = labels.get(TIER_LABEL_KEY, str(DEFAULT_TIER))
         try:
             tier = int(tier_str)
@@ -301,7 +313,11 @@ def get_queue_status_from_cache():
         created_at = parse_k8s_timestamp(creation_ts)
         wait_seconds = (now_utc - created_at).total_seconds()
         aging_bonus = int(wait_seconds // aging_interval)
-        effective_tier = max(aging_min, tier - aging_bonus)
+        # High Fix: tier가 이미 aging_min보다 낮은 경우(예: tier-0 urgent) aging_min 바닥값으로
+        # 강등되지 않아야 한다. min(tier, ...) 로 자신의 원래 tier보다 높아지지 않도록 보장.
+        # 예) tier=0, aging_min=1: min(0, max(1,-N)) = 0 (긴급 우선순위 유지)
+        # 예) tier=3, aging_min=1: min(3, max(1,-2)) = 1 (aging 정상 동작)
+        effective_tier = min(tier, max(aging_min, tier - aging_bonus))
         return (effective_tier, creation_ts)
 
     managed_pending_list.sort(key=get_priority_and_time)
@@ -317,18 +333,35 @@ def update_cache(event_type, obj):
     key = f"{ns}/{name}"
 
     with cache_lock:
+        existing = local_cache.get(key)
+        # Critical 1 Fix: phantom entry(resourceVersion='__admitted__')가 실제 K8s 이벤트로
+        # 교체되는 경우에도 webhook_admitted_count를 감소시켜야 한다.
+        # 기존: is_new_addition=False (phantom 있음) → 카운터 감소 안 됨 → 영구 누적
+        # 수정: phantom 교체 여부를 별도 플래그로 추적
+        is_phantom_replacement = (
+            existing is not None and
+            existing.get('metadata', {}).get('resourceVersion') == '__admitted__'
+        )
         is_new_addition = key not in local_cache
+
         if event_type == 'DELETED' and key in local_cache:
             del local_cache[key]
         elif event_type != 'DELETED':
             local_cache[key] = obj
 
-    if is_new_addition and event_type in ('ADDED', 'MODIFIED'):
-        if is_target_namespace(ns):
+    if is_target_namespace(ns):
+        if event_type in ('ADDED', 'MODIFIED') and (is_new_addition or is_phantom_replacement):
+            # 실제 K8s 객체가 도착: 새 항목이거나 phantom을 교체하는 경우 카운터 감소
             spec_status = obj.get('spec', {}).get('status')
             if spec_status != 'PipelineRunPending':
                 with admitted_lock:
                     webhook_admitted_count = max(0, webhook_admitted_count - 1)
+        elif event_type == 'DELETED' and is_phantom_replacement:
+            # High Fix: DELETED phantom 미감소 수정
+            # phantom이 ADDED 없이 DELETED로 사라지는 경우 (PR 생성 실패/즉시 삭제)
+            # admitted_count는 여전히 1이 남아 있으므로 감소 필요
+            with admitted_lock:
+                webhook_admitted_count = max(0, webhook_admitted_count - 1)
 
 # ---------------------------------------------------------
 # [Health Check & Metrics]
@@ -366,11 +399,32 @@ def readyz():
 def mutate_pipelinerun():
     global webhook_admitted_count
     request_info = request.get_json()
+    # High Fix: request_info / metadata null 방어
+    # Content-Type 오류나 파싱 실패 시 None이 반환되어 AttributeError 발생 방지
+    if not request_info:
+        log("[경고] Webhook 요청 파싱 실패. 통과 처리.")
+        return jsonify({
+            "apiVersion": "admission.k8s.io/v1",
+            "kind": "AdmissionReview",
+            "response": {"uid": "", "allowed": True}
+        })
     uid = request_info.get("request", {}).get("uid", "")
     req_obj = request_info.get("request", {}).get("object", {})
-    metadata = req_obj.get("metadata", {})
+    metadata = req_obj.get("metadata") or {}
     namespace = metadata.get("namespace", "")
-    labels = metadata.get("labels", {})
+    # Critical 3 Fix: metadata.labels가 명시적 null로 넘어오는 경우 AttributeError 방지
+    labels = metadata.get("labels") or {}
+
+    # Bug 3 Fix: 초기 캐시 동기화가 완료되지 않은 상태에서 요청이 들어오면
+    # running_cnt = 0으로 보여 모든 PR이 즉시 통과되는 문제를 방지한다.
+    # (readyz probe가 503을 반환하지만, 방어적 이중 체크)
+    if not initial_sync_done:
+        log(f"[경고] 캐시 미동기화 상태에서 Webhook 요청 수신 ({namespace}). 통과 처리.")
+        return jsonify({
+            "apiVersion": "admission.k8s.io/v1",
+            "kind": "AdmissionReview",
+            "response": {"uid": uid, "allowed": True}
+        })
 
     if not is_target_namespace(namespace):
         return jsonify({
@@ -390,9 +444,6 @@ def mutate_pipelinerun():
     limit = cfg["max_pipelines"]
     running_cnt, _ = get_queue_status_from_cache()
 
-    with admitted_lock:
-        effective_running = running_cnt + webhook_admitted_count
-
     # 패치 준비
     tier_label_escaped = TIER_LABEL_KEY.replace("/", "~1")
     managed_label_escaped = MANAGED_LABEL_KEY.replace("/", "~1")
@@ -402,7 +453,19 @@ def mutate_pipelinerun():
     is_urgent = labels.get('queue.tekton.dev/urgent', '') == 'true'
     match_info = "urgent" if is_urgent else f"env:{env_val}"
 
-    if effective_running >= limit:
+    # Bug 1 Fix: TOCTOU Race Condition 수정
+    # 기존: 쿼터 체크(read)와 카운터 증가(write)가 별도 락 블록으로 분리되어
+    #        Flask threaded=True 환경에서 동시 요청이 모두 체크를 통과할 수 있었음.
+    # 수정: 단일 admitted_lock 블록 안에서 체크와 증가를 원자적으로 처리.
+    with admitted_lock:
+        effective_running = running_cnt + webhook_admitted_count
+        if effective_running < limit:
+            webhook_admitted_count += 1
+            should_admit = True
+        else:
+            should_admit = False
+
+    if not should_admit:
         METRIC_WEBHOOK_QUEUED.labels(tier=str(tier_val)).inc()
         # [대기열 전환]
         log(f"[Webhook 차단] {namespace}/{pr_name} ({ptype}/{match_info}, Tier {tier_val}) "
@@ -411,7 +474,10 @@ def mutate_pipelinerun():
         patch = [
             {"op": "add", "path": "/spec/status", "value": "PipelineRunPending"}
         ]
-        if "labels" not in metadata:
+        # Critical Fix: "labels" 키가 없거나 null인 경우 모두 labels 맵을 새로 생성해야 한다.
+        # 기존: "labels" not in metadata → 키가 있지만 null인 경우 else로 진입해
+        #       null 하위 경로에 add → K8s Patch 실패
+        if not metadata.get("labels"):
             patch.append({
                 "op": "add", "path": "/metadata/labels",
                 "value": {
@@ -442,17 +508,38 @@ def mutate_pipelinerun():
         })
 
     # [즉시 실행]
-    with admitted_lock:
-        webhook_admitted_count += 1
+    # Critical 2 Fix: generateName PR은 Webhook 시점에 실제 이름을 알 수 없어
+    # phantom entry의 key가 Watcher 이벤트 key와 달라 캐시에 영구 잔존하는 문제 방지.
+    # name이 확정된 PR에 한해서만 phantom entry를 삽입한다.
+    pr_real_name = metadata.get('name')
+    if pr_real_name:
+        pr_key = f"{namespace}/{pr_real_name}"
+        phantom_labels = dict(labels)
+        phantom_labels[TIER_LABEL_KEY] = str(tier_val)
+        phantom_entry = {
+            'metadata': {
+                'namespace': namespace,
+                'name': pr_real_name,
+                'labels': phantom_labels,
+                'creationTimestamp': datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                'resourceVersion': '__admitted__',
+            },
+            'spec': {'status': None},
+            'status': {},
+        }
+        with cache_lock:
+            if pr_key not in local_cache:
+                local_cache[pr_key] = phantom_entry
 
     METRIC_WEBHOOK_ADMITTED.labels(tier=str(tier_val)).inc()
 
     log(f"[Webhook 통과] {namespace}/{pr_name} ({ptype}/{match_info}, Tier {tier_val}) "
-        f"-> 즉시 실행 허용 (Running:{effective_running+1}/{limit})")
+        f"-> 즉시 실행 허용 (Running:{effective_running + 1}/{limit})")
 
     # 통과 시에도 티어 라벨 부여
+    # Critical Fix: labels null 케이스 동일하게 처리
     patch = []
-    if "labels" not in metadata:
+    if not metadata.get("labels"):
         patch.append({
             "op": "add", "path": "/metadata/labels",
             "value": {TIER_LABEL_KEY: str(tier_val)}
@@ -485,6 +572,11 @@ def leader_election_loop():
     log(f"[LeaderElection] 시작 (Pod: {POD_NAME}, Lease: {LEASE_NAMESPACE}/{LEASE_NAME})")
 
     while True:
+        # Medium Fix: 409 핸들링 개선
+        # 갱신(renewal) 실패 vs 탈취(takeover) 실패를 구분한다.
+        # - 갱신 409: 일시적 충돌. is_leader 유지, Lease TTL이 자연 failover를 처리.
+        # - 탈취/생성 409: 다른 Pod가 먼저 획득. is_leader 해제.
+        _is_renewal_attempt = False
         try:
             now = datetime.datetime.now(datetime.timezone.utc)
 
@@ -523,6 +615,7 @@ def leader_election_loop():
 
             if holder == POD_NAME:
                 # 내가 Leader → 갱신
+                _is_renewal_attempt = True
                 lease.spec.renew_time = now
                 coord_api.replace_namespaced_lease(LEASE_NAME, LEASE_NAMESPACE, lease)
                 with leader_lock:
@@ -554,8 +647,16 @@ def leader_election_loop():
         except ApiException as e:
             METRIC_API_ERRORS.labels(operation='leader_election').inc()
             if e.status == 409:
-                # Conflict → 다른 Pod가 먼저 업데이트함
-                log(f"[LeaderElection] Lease 충돌 (409 Conflict). 다음 주기에 재시도.")
+                if _is_renewal_attempt:
+                    # 갱신 409: is_leader 유지. Lease TTL(15s) 내 재시도로 자연 해결.
+                    # 즉시 해제하면 매 네트워크 지연마다 불필요한 스케줄링 공백 발생.
+                    log(f"[LeaderElection] Lease 갱신 충돌 (409). is_leader 유지 후 재시도.")
+                else:
+                    # 탈취/생성 409: 다른 Pod가 먼저 Lease 획득 → Leader 해제
+                    log(f"[LeaderElection] Lease 탈취 충돌 (409). Leader 상태 해제.")
+                    with leader_lock:
+                        if is_leader:
+                            is_leader = False
             else:
                 log(f"[LeaderElection] API 에러 ({e.status}): {e.reason}")
         except Exception as e:
@@ -590,24 +691,33 @@ def manager_loop():
             # 업데이트 매트릭스
             METRIC_QUEUE_LIMIT.set(limit)
             METRIC_QUEUE_RUNNING.set(running)
-            
+
             METRIC_QUEUE_PENDING.clear()
             pending_by_tier = {}
             for target in pending:
-                t_labels = target['metadata'].get('labels', {})
+                t_labels = target['metadata'].get('labels') or {}
                 tier_val = t_labels.get(TIER_LABEL_KEY, str(DEFAULT_TIER))
                 pending_by_tier[tier_val] = pending_by_tier.get(tier_val, 0) + 1
             for t_val, count in pending_by_tier.items():
                 METRIC_QUEUE_PENDING.labels(tier=str(t_val)).set(count)
 
-            if running < limit and pending:
-                slots = limit - running
-                to_run = pending[:slots]
+            # High 1 Fix: Manager-Webhook 슬롯 이중 소비 방지
+            # Webhook이 이미 통과시킨 in-flight PR을 포함해 가용 슬롯을 계산한다.
+            with admitted_lock:
+                effective_running = running + webhook_admitted_count
+            available_slots = limit - effective_running
 
-                for target in to_run:
+            if available_slots > 0 and pending:
+                # Medium 1 Fix: 패치 실패 시 슬롯을 다음 우선순위 PR에 양보한다.
+                # 기존: to_run = pending[:slots] 후 실패해도 해당 슬롯 낭비
+                # 수정: pending 순회하며 성공한 수(scheduled)로만 슬롯 카운트
+                scheduled = 0
+                for target in pending:
+                    if scheduled >= available_slots:
+                        break
                     t_name = target['metadata']['name']
                     t_ns = target['metadata']['namespace']
-                    t_labels = target['metadata'].get('labels', {})
+                    t_labels = target['metadata'].get('labels') or {}
                     tier_val = t_labels.get(TIER_LABEL_KEY, str(DEFAULT_TIER))
                     ptype = t_labels.get('type', '?')
                     env_val = t_labels.get(ENV_LABEL_KEY, '?')
@@ -625,7 +735,7 @@ def manager_loop():
                         log(f"[스케줄링 완료] {t_ns}/{t_name} ({ptype}/{env_val}, "
                             f"Tier {tier_val}, 대기시간: {int(wait_secs)}s) -> 실행 시작")
                         running += 1
-                        slots -= 1
+                        scheduled += 1
 
                         with cache_lock:
                             key = f"{t_ns}/{t_name}"
@@ -636,8 +746,10 @@ def manager_loop():
                         METRIC_API_ERRORS.labels(operation='patch_pipelinerun').inc()
                         log(f"[에러] 실행 패치 실패 ({t_ns}/{t_name}): "
                             f"API 에러 {e.status} - {e.reason}")
+                        # 슬롯 양보: scheduled 증가 없이 다음 PR로 계속
                     except Exception as e:
                         log(f"[에러] 실행 패치 실패 ({t_ns}/{t_name}): {e}")
+                        # 슬롯 양보: scheduled 증가 없이 다음 PR로 계속
         except Exception as e:
             log(f"[에러] Manager 루프 에러: {e}")
         time.sleep(5)
