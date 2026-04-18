@@ -192,7 +192,10 @@ def _try_increment_global_admitted(running_cnt, limit, max_retries=5):
             if e.status == 409:
                 continue
             elif e.status == 404:
-                _ensure_admitted_configmap()
+                try:
+                    _ensure_admitted_configmap()
+                except Exception:
+                    break  # CM 생성도 실패하면 per-pod fallback으로 전환
                 continue
             else:
                 log(f"[AdmittedCM] ConfigMap 업데이트 실패 (API {e.status}). per-pod fallback 사용.")
@@ -375,7 +378,6 @@ def get_queue_status_from_cache():
 
 
 def update_cache(event_type, obj):
-    global webhook_admitted_count
     ns = obj['metadata']['namespace']
     name = obj['metadata'].get('name', 'unknown')
     key = f"{ns}/{name}"
@@ -399,12 +401,10 @@ def update_cache(event_type, obj):
         if event_type in ('ADDED', 'MODIFIED') and (is_new_addition or is_phantom_replacement):
             spec_status = obj.get('spec', {}).get('status')
             if spec_status != 'PipelineRunPending':
-                with admitted_lock:
-                    webhook_admitted_count = max(0, webhook_admitted_count - 1)
+                _decrement_global_admitted()
         elif event_type == 'DELETED' and is_phantom_replacement:
             # phantom이 ADDED 없이 DELETED된 경우(PR 생성 실패)에도 카운터를 감소시켜야 한다.
-            with admitted_lock:
-                webhook_admitted_count = max(0, webhook_admitted_count - 1)
+            _decrement_global_admitted()
 
 
 @app.route('/healthz', methods=['GET'])
@@ -432,7 +432,6 @@ def readyz():
 
 @app.route('/mutate', methods=['POST'])
 def mutate_pipelinerun():
-    global webhook_admitted_count
     request_info = request.get_json()
     if not request_info:
         log("[경고] Webhook 요청 파싱 실패. 통과 처리.")
@@ -506,14 +505,9 @@ def mutate_pipelinerun():
     is_urgent = labels.get('queue.tekton.dev/urgent', '') == 'true'
     match_info = "urgent" if is_urgent else f"env:{env_val}"
 
-    # 쿼터 체크와 카운터 증가를 단일 락 블록에서 원자적으로 처리해 TOCTOU 방지.
-    with admitted_lock:
-        effective_running = running_cnt + webhook_admitted_count
-        if effective_running < limit:
-            webhook_admitted_count += 1
-            should_admit = True
-        else:
-            should_admit = False
+    # ConfigMap을 primary로, per-pod webhook_admitted_count를 fallback으로 사용해
+    # HA 환경에서도 cross-pod 원자적 쿼터 체크를 수행한다.
+    should_admit, effective_running = _try_increment_global_admitted(running_cnt, limit)
 
     if not should_admit:
         METRIC_WEBHOOK_QUEUED.labels(tier=str(tier_val)).inc()
@@ -652,8 +646,7 @@ def leader_election_loop():
                     was_leader = is_leader
                     is_leader = True
                 if not was_leader:
-                    with admitted_lock:
-                        webhook_admitted_count = 0
+                    _reset_global_admitted()
                     log(f"[LeaderElection] Leader 승격 (이전 Leader: {holder}, Lease 만료)")
             else:
                 with leader_lock:
@@ -713,8 +706,7 @@ def manager_loop():
                 METRIC_QUEUE_PENDING.labels(tier=str(t_val)).set(count)
 
             # Webhook이 통과시킨 in-flight PR을 포함해 가용 슬롯을 계산해 이중 소비를 방지한다.
-            with admitted_lock:
-                effective_running = running + webhook_admitted_count
+            effective_running = running + _get_global_admitted()
             available_slots = limit - effective_running
 
             if available_slots > 0 and pending:
@@ -757,7 +749,7 @@ def manager_loop():
 
 
 def watcher_loop():
-    global webhook_admitted_count, initial_sync_done
+    global initial_sync_done
     log("[Watcher] 스레드 시작 (Informer 동기화)")
     resource_version = None
     while True:
@@ -776,8 +768,7 @@ def watcher_loop():
                 with cache_lock:
                     local_cache.clear()
                     local_cache.update(new_cache)
-                with admitted_lock:
-                    webhook_admitted_count = 0
+                _reset_global_admitted()
                 if not initial_sync_done:
                     initial_sync_done = True
                     log("초기 동기화 완료. Webhook 트래픽 수신을 시작합니다.")
