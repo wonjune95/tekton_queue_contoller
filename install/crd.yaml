@@ -26,7 +26,7 @@ spec:
               properties:
                 namespacePatterns:
                   type: array
-                  description: "관리 대상 네임스페이스 패턴 목록 (fnmatch 문법). 미설정 시 환경변수 사용."
+                  description: "관리 대상 네임스페이스 패턴 목록 (fnmatch 문법). 미설정 시 기본값 *-cicd 사용."
                   items:
                     type: string
                 maxPipelines:
@@ -40,6 +40,9 @@ spec:
                   type: integer
                   default: 1
                   description: "에이징으로 도달 가능한 최소 Tier (0은 긴급 전용)"
+                dashboardSAPattern:
+                  type: string
+                  description: "실행 허용 출처 SA 패턴 (fnmatch 문법). 미설정 시 DASHBOARD_SA_PATTERN 환경변수 또는 기본값 사용."
                 tierRules:
                   type: array
                   description: "티어 분류 규칙. 순서대로 매칭되며 먼저 매칭된 규칙이 적용된다."
