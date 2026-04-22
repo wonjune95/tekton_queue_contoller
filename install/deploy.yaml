@@ -24,6 +24,9 @@ rules:
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "create", "update"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "create", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -70,6 +73,7 @@ webhooks:
         name: tekton-queue-controller
         namespace: tekton-pipelines
         path: "/mutate"
+        port: 8443
       caBundle: "<BASE64_ENCODED_CA_CERT_HERE>" # 주의: 실제 Base64 인코딩 값으로 교체하세요!
     rules:
       - operations: ["CREATE"]
