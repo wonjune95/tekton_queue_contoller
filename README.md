@@ -326,19 +326,104 @@ scrape_configs:
 
 ---
 
-## 10. 빌드
+## 10. Docker 이미지 빌드
 
-Makefile을 사용하여 편리하게 빌드 및 배포할 수 있습니다.
+### 10.1. Dockerfile 구조
+
+이미지는 `docker/Dockerfile`에 정의되어 있으며, **Python 3.11-slim** 기반으로 빌드됩니다.
+
+```
+python:3.11-slim (Base)
+  └─ /app
+       ├── requirements.txt   ← pip 의존성 설치
+       ├── src/                ← 비즈니스 로직 모듈
+       └── app.py              ← 엔트리포인트
+```
+
+| 레이어 | 설명 |
+|--------|------|
+| `COPY requirements.txt` → `pip install` | 의존성만 먼저 설치하여 Docker 캐시 최적화 |
+| `COPY src/`, `COPY app.py` | 소스 코드 복사 |
+| `useradd -u 1001 appuser` | 보안을 위한 비루트 사용자 실행 |
+| `EXPOSE 8443 / 9090` | Webhook(HTTPS) 및 Prometheus 메트릭 포트 |
+
+### 10.2. 이미지 빌드 (수동)
+
+프로젝트 루트 디렉터리에서 실행합니다.
 
 ```bash
 # 기본 빌드
-make build
+docker build -t tekton-queue-controller:local -f docker/Dockerfile .
+```
 
-# 이미지 빌드 및 Kind 클러스터 로드
-make load
+빌드가 완료되면 이미지를 확인합니다.
 
-# K8s 배포 (install 디렉터리)
-make deploy
+```bash
+docker images | grep tekton-queue-controller
+# tekton-queue-controller   local   abc123def456   10 seconds ago   185MB
+```
+
+### 10.3. 이미지 태깅
+
+배포 환경에 맞게 태그를 지정합니다.
+
+```bash
+# 버전 태그
+docker tag tekton-queue-controller:local tekton-queue-controller:v1.0.0
+
+# 프라이빗 레지스트리 태그
+docker tag tekton-queue-controller:local <REGISTRY_HOST>/tekton-queue-controller:v1.0.0
+
+# 예시: Harbor 레지스트리
+docker tag tekton-queue-controller:local harbor.example.com/devops/tekton-queue-controller:v1.0.0
+```
+
+### 10.4. 레지스트리에 Push
+
+```bash
+# 레지스트리 로그인
+docker login <REGISTRY_HOST>
+
+# 이미지 푸시
+docker push <REGISTRY_HOST>/tekton-queue-controller:v1.0.0
+
+# 예시: Harbor
+docker push harbor.example.com/devops/tekton-queue-controller:v1.0.0
+```
+
+> **참고:** `install/deploy.yaml`의 `spec.containers[].image` 값을 푸시한 이미지 경로로 변경해야 합니다.
+
+### 10.5. Kind 로컬 클러스터에 로드
+
+프라이빗 레지스트리 없이 로컬 Kind 클러스터에서 테스트하려면 이미지를 직접 로드합니다.
+
+```bash
+# Kind 클러스터에 이미지 로드
+kind load docker-image tekton-queue-controller:local --name tekton-test
+```
+
+### 10.6. Makefile 단축 명령
+
+위 과정을 Makefile로 간편하게 실행할 수 있습니다.
+
+```bash
+make build    # Docker 이미지 빌드
+make load     # 빌드 + Kind 클러스터 로드
+make deploy   # K8s 리소스 배포 (install/ 디렉터리)
+make all      # 빌드 + 로드 + 배포 (전체 워크플로우)
+make test     # pytest 단위 테스트
+make lint     # flake8 코드 검사
+make clean    # 이미지 삭제
+```
+
+Makefile 변수를 오버라이드하여 이미지 이름과 태그를 변경할 수 있습니다.
+
+```bash
+# 커스텀 이미지 이름/태그로 빌드
+make build IMAGE_NAME=harbor.example.com/devops/tekton-queue-controller IMAGE_TAG=v1.0.0
+
+# 다른 Kind 클러스터에 로드
+make load CLUSTER_NAME=my-cluster
 ```
 
 ---
