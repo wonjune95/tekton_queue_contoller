@@ -1,0 +1,38 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: tekton-queue-controller-netpol
+  namespace: tekton-pipelines
+spec:
+  podSelector:
+    matchLabels:
+      app: tekton-queue
+  policyTypes:
+    - Ingress
+    - Egress
+
+  ingress:
+    # Webhook(8443): 모든 네임스페이스의 API 서버 트래픽 허용
+    - ports:
+        - protocol: TCP
+          port: 8443
+    # Prometheus scrape(9090): 모니터링 네임스페이스 허용
+    - ports:
+        - protocol: TCP
+          port: 9090
+      from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+
+  egress:
+    # K8s API 서버 (443)
+    - ports:
+        - protocol: TCP
+          port: 443
+    # DNS 조회
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

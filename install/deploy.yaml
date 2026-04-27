@@ -48,7 +48,7 @@ metadata:
   namespace: tekton-pipelines
   annotations:
     prometheus.io/scrape: "true"
-    prometheus.io/scheme: "https"
+    prometheus.io/scheme: "http"
     prometheus.io/path: "/metrics"
     prometheus.io/port: "9090"
 spec:

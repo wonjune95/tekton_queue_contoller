@@ -328,10 +328,17 @@ scrape_configs:
 
 ## 10. 빌드
 
+Makefile을 사용하여 편리하게 빌드 및 배포할 수 있습니다.
+
 ```bash
-cd docker
-docker build -t your-registry/tekton-queue-controller:v0.4.0 .
-docker push your-registry/tekton-queue-controller:v0.4.0
+# 기본 빌드
+make build
+
+# 이미지 빌드 및 Kind 클러스터 로드
+make load
+
+# K8s 배포 (install 디렉터리)
+make deploy
 ```
 
 ---
@@ -340,18 +347,35 @@ docker push your-registry/tekton-queue-controller:v0.4.0
 
 ```
 tekton_queue_controller/
+├── Makefile                # 빌드 및 배포, 자동화 명령어
 ├── docker/
-│   ├── Dockerfile          # 컨테이너 이미지 빌드 파일
-│   ├── app.py              # 메인 컨트롤러 소스 코드
-│   └── requirements.txt    # Python 의존성
-├── install/
-│   ├── crd.yaml            # GlobalLimit CRD 스키마
-│   ├── deploy.yaml         # RBAC, Service, Webhook, Deployment
-│   ├── limit-setting.yaml  # GlobalLimit 설정 예시
-│   └── secret.yaml         # TLS Secret 템플릿
-├── grafana-dashbaord/
-│   └── grafana-dashboard.json
-└── README.md
+│   ├── Dockerfile          # 컨테이너 이미지 빌드 스크립트 (Python 3.11+)
+│   ├── app.py              # 메인 엔트리포인트 (Slim Wrapper)
+│   └── requirements.txt    # Python 의존성 (Flask, Kubernetes 등)
+├── src/                    # 비즈니스 로직(Backend 모듈)
+│   ├── __init__.py
+│   ├── state.py            # Global 공유 상태 자원
+│   ├── config.py           # CRD 설정 로드 및 환경변수
+│   ├── cache.py            # 인메모리 PR 캐시 및 Admitted 카운터 제어
+│   ├── metrics.py          # Prometheus 메트릭 정의
+│   ├── webhook.py          # Flask 기반 Mutating Webhook API
+│   └── workers/            # 백그라운드 Worker 스레드
+│       ├── __init__.py
+│       ├── leader.py       # Kubernetes Lease 기반 리더 선출
+│       ├── manager.py      # 티어 기반 대기열 평가 및 스케줄링
+│       └── watcher.py      # PipelineRun Informer/Watcher 동기화
+├── docs/                   # 아키텍처 및 SRE 운영 문서
+│   ├── architecture.md     # 시스템 아키텍처 및 상세 컴포넌트 구조
+│   ├── security.md         # 네트워크 정책 및 권한 가이드
+│   └── runbook.md          # 롤백 및 장애 대응 매뉴얼
+├── install/                # K8s 매니페스트
+│   ├── crd.yaml
+│   ├── deploy.yaml
+│   ├── limit-setting.yaml
+│   ├── networkpolicy.yaml
+│   └── secret.yaml
+└── grafana-dashboard/
+    └── grafana-dashboard.json
 ```
 
 ---
