@@ -218,7 +218,6 @@ sequenceDiagram
 |------|-------------|----------------|
 | 다중 Pod 간 전역 쿼터 정합성 | 인가 결정을 매니저 루프 한 곳으로 단일화 (Leader만 수행) | 분산 락·외부 스토리지 불필요 → 인프라 의존성 0 ([§2.1](#21-요청-처리-흐름)) |
 | 쿼터 초과 PR 처리 | Admission 단계에서 `PipelineRunPending` 주입 | PR 강제 삭제/재생성 없는 비파괴적 제어 |
-| 카운터 누수 복구 | Manager 루프 OR-게이트 자가 치유 | 운영자 개입 없이 30초 내 자동 보정 ([§12.2](#122-자가-치유-self-healing)) |
 | 고가용성 | K8s Lease 기반 Leader Election | ZooKeeper 등 외부 코디네이터 직접 운영 불필요 |
 
 > **왜 Go(controller-runtime)가 아니라 Python인가?**
