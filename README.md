@@ -50,7 +50,7 @@ make kind-test    # PipelineRun 24개 버스트 생성 → 큐 적체·소진 �
 | 2 | [워크플로우](#2-워크플로우) | 9 | [모니터링 (Prometheus)](#9-모니터링-prometheus) |
 | 3 | [아키텍처](#3-아키텍처) | 10 | [Docker 이미지 빌드](#10-docker-이미지-빌드) |
 | 4 | [우선순위 스케줄링](#4-우선순위-스케줄링) | 11 | [프로젝트 구조](#11-프로젝트-구조) |
-| 5 | [네임스페이스 설정](#5-네임스페이스-설정) | 12 | [admitted 카운터 & 자가 치유](#12-admitted-카운터--자가-치유-self-healing) |
+| 5 | [네임스페이스 설정](#5-네임스페이스-설정) | 12 | [인가 경로](#12-인가-경로-admission-path) |
 | 6 | [고가용성 (HA)](#6-고가용성-ha-구성) | 13 | [검증 (Verification)](#13-검증-verification) |
 | 7 | [설치 및 배포](#7-설치-및-배포) | 14 | [설계 한계 및 향후 과제](#14-설계-한계-및-향후-과제) |
 
@@ -78,7 +78,7 @@ Tekton Pipelines는 클러스터 전체 단위의 동시 실행 개수를 제한
 
 ### 2.0. 전체 흐름 한눈에 보기
 
-PipelineRun 생성부터 실행까지의 전체 경로 — ① Admission Webhook(쿼터 판정) → ② Controller Pod(캐시·스케줄링·자가 치유) → ③ HA(Leader Election)를 한 장으로 정리한 그림입니다. 그림에 등장하는 `admitted` 카운터의 상세 동작과 자가 치유는 [§12](#12-admitted-카운터--자가-치유-self-healing)에서 다룹니다.
+PipelineRun 생성부터 실행까지의 전체 경로 — ① Admission Webhook(쿼터 판정) → ② Controller Pod(캐시·스케줄링·자가 치유) → ③ HA(Leader Election)를 한 장으로 정리한 그림입니다. 인가 결정이 어디서 일어나는지는 [§12](#12-인가-경로-admission-path)에서 다룹니다.
 
 <div align="center">
   <img src="docs/images/workflow.png" alt="Tekton Queue Controller 전체 워크플로우" width="900"/>
@@ -592,56 +592,32 @@ tekton_queue_controller/
 
 ---
 
-## 12. admitted 카운터 & 자가 치유 (Self-healing)
+## 12. 인가 경로 (Admission Path)
 
-> **현재 구조에서의 위치**
->
-> 이 카운터는 **웹훅이 직접 인가하던 시절**에 도입된 장치입니다. 당시에는 "웹훅이 통과시켰지만
-> 아직 Watcher 캐시에 running으로 반영되기 전"인 인플라이트 수를 메워야 했습니다.
->
-> 그러나 이 방식으로는 **동시 인가 요청에서 상한이 깨졌습니다**(실측: 동시 12요청 시 상한 30에 대해 최대 48).
-> 카운터가 감소하는 시점과 그 건이 running 수에 반영되는 시점이 어긋나는 창이 남기 때문입니다.
-> 현재는 [§2.1](#21-요청-처리-흐름)대로 **웹훅이 인가를 판정하지 않고 매니저 루프가 전담**하므로
-> 인플라이트 창 자체가 존재하지 않습니다.
->
-> 카운터와 자가 치유 로직은 **매니저의 안전망으로 남겨 두었습니다**. 매니저는 여전히
-> `running + admitted` 로 슬롯을 계산하므로, 외부 요인으로 카운터가 남더라도 과잉 인가로 이어지지 않습니다.
-> 아래 설명은 그 안전망의 동작입니다.
-
-### 12.1. 무엇을 기록하는가
-
-**클러스터 공용 ConfigMap(`tekton-queue-admitted-count`)** 에 인플라이트 수를 기록합니다.
-매니저는 슬롯 계산 시 이 값을 running 수에 더해, 남아 있는 값이 있으면 보수적으로 판단합니다.
+인가 결정은 **매니저 루프 한 곳에서만** 일어납니다. 웹훅은 판정하지 않습니다.
 
 ```mermaid
 flowchart LR
-    CM[("ConfigMap<br/>admitted")] -- "running + admitted" --> Slot{매니저 슬롯 계산}
-    Slot --> Heal["누수 지속 시<br/>자가 보정 → 0"]
-    Heal --> CM
+    W["Webhook (모든 Pod)"] -- "PipelineRunPending + managed 라벨" --> Q[(대기열)]
+    Q --> M["Manager (Leader Pod 전용)<br/>5초 주기"]
+    M -- "available_slots = limit - running" --> S([빈 슬롯만큼 실행 시작])
+    S -. "한 사이클에서 실행시킨 건수만큼<br/>남은 슬롯 차감" .-> M
 
-    classDef cm fill:#0969da,stroke:#0a5cc4,color:#fff;
-    class CM cm;
+    classDef run fill:#2ea44f,stroke:#1a7f37,color:#fff;
+    class S run;
 ```
 
-| 단계 | 동작 |
-|------|------|
-| **증가** | (구버전) 웹훅이 직접 인가하던 시절 통과 시 +1. **현재 웹훅은 증가시키지 않는다** |
-| **Phantom** | 실명 PR은 캐시에 `resourceVersion: __admitted__` 임시 엔트리 삽입 → Watcher 이벤트 도착 전까지 running으로 집계 |
-| **감소** | Watcher가 실제 PR ADDED를 관측하면 `admitted` -1 |
-| **Fallback** | ConfigMap API 장애 시 per-pod 로컬 카운터로 graceful degradation |
+### 12.1. 왜 단일 지점인가
 
-### 12.2. 자가 치유 (Self-healing)
+웹훅은 요청마다 독립적으로 실행됩니다. 슬롯 확인과 실행 허용을 웹훅에서 처리하면 동시에 들어온 요청들이 각자 자기 시점의 상태를 보고 판정하므로 순간적으로 상한을 넘길 수 있습니다. 실측에서 동시 12요청 시 상한 30에 대해 최대 48까지 올라갔습니다(직렬 도착에서는 재현되지 않음).
 
-ConfigMap 감산이 **5회 재시도 모두 실패**(API 순단·경합)하면 공용 카운터가 실제보다 높게 **누수(leak)** 될 수 있습니다. Watcher 전체 재동기화(410 Gone)는 한가한 클러스터에서 드물게 발생하므로, Manager 루프가 두 가지 누수 징후를 **OR**로 감지해 30초 이상 지속될 때 카운터를 0으로 자동 보정합니다.
+인가를 단일 스레드로 모으면 경쟁 자체가 성립하지 않습니다. 매니저는 한 사이클에서 실행시킨 건수를 세어 남은 슬롯을 차감하므로 사이클 내 초과도 없습니다.
 
-| 게이트 | 조건 | 잡는 상황 |
-|--------|------|-----------|
-| **idle 선제 청소** | `running == 0` 이고 `admitted > 0` | 모두 종료됐는데 카운터만 남음 → 다음 신규 요청의 "유령 대기" 방지 |
-| **starvation 구제** | `pending` 존재 & `available_slots ≤ 0` & `admitted > 0` | 부분 누수가 누적되어 실행 중 PR이 있어도 스케줄링이 막힌 경우 |
+### 12.2. 이전 구조에서 쓰던 admitted 카운터
 
-> 30초 임계값은 통상 in-flight 머티리얼라이제이션 시간(~2초)보다 충분히 길어, 정상 동작을 오탐하지 않습니다. (K8s Admission Webhook 최대 타임아웃과도 정합)
+이전에는 웹훅이 직접 인가했고, "통과시켰지만 아직 Watcher 캐시에 running 으로 반영되기 전"인 인플라이트 수를 ConfigMap 카운터로 메웠습니다. 그러나 카운터가 감소하는 시점과 그 건이 running 수에 반영되는 시점이 어긋나는 창이 남아 상한이 깨졌고, ConfigMap 낙관적 락 경합으로 웹훅 p99 지연이 6~9 ms 에서 925~5,000 ms 로 증가했습니다.
 
----
+인가가 매니저로 단일화되면서 인플라이트 구간 자체가 사라졌으므로 카운터는 제거했습니다. `tekton_queue_webhook_admitted_total` 지표는 기존 대시보드 호환을 위해 정의만 남아 있으며 더 이상 증가하지 않습니다.
 
 ## 13. 검증 (Verification)
 
@@ -683,7 +659,7 @@ python -m tests.integration_scenarios
 ## 14. 설계 한계 및 향후 과제
 
 - **비선점형 설계:** 실행 중인 낮은 티어 파이프라인의 선점은 지원하지 않습니다. 우선순위 정렬은 대기열 진입 이후 Manager에서만 적용됩니다.
-- **admitted 카운터 정합성:** 외부 요인으로 카운터가 일시적으로 높게 유지될 수 있으나, [§12.2 자가 치유](#122-자가-치유-self-healing)가 누수를 30초 내 자동 보정하며 Watcher 전체 재동기화 시에도 리셋됩니다.
+- **admitted 카운터 정합성:** 외부 요인으로 카운터가 일시적으로 높게 유지될 수 있으나, [§12](#12-인가-경로-admission-path) 참조.
 - **CRD 변경 반영 지연:** GlobalLimit CRD 변경 시 최대 5초의 반영 지연이 있습니다.
 - **HA Failover 지연:** Leader 장애 시 최대 ~15초의 스케줄링 공백이 발생합니다. 이 동안 Webhook은 모든 Pod에서 정상 처리됩니다.
 - **관리 SA 패턴 변경 시 재배포 필요:** `MANAGED_SA_PATTERNS` 환경변수 변경은 Pod 재시작이 필요합니다. SA 패턴 추가는 `spec.managedSAPatterns` 배열에 항목을 추가하면 재배포 없이 반영됩니다.
