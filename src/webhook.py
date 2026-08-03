@@ -6,7 +6,6 @@ Flask 앱과 /mutate, /healthz, /readyz 라우트를 정의합니다.
 import json
 import base64
 import fnmatch
-import datetime
 import time
 
 from flask import Flask, request, jsonify, g
@@ -18,7 +17,7 @@ from src.config import (
 )
 from src.cache import (
     local_cache, cache_lock,
-    get_queue_status_from_cache, _try_increment_global_admitted,
+    get_queue_status_from_cache,
     _get_global_admitted, parse_k8s_timestamp,
 )
 from src import metrics as m
@@ -112,44 +111,25 @@ def mutate_pipelinerun():
     is_urgent    = labels.get('queue.tekton.dev/urgent', '') == 'true'
     match_info   = "urgent" if is_urgent else f"env:{env_val}"
 
-    should_admit, effective_running = _try_increment_global_admitted(running_cnt, limit)
-
-    # 쿼터 초과 → Pending + managed 라벨 (대기열)
-    if not should_admit:
-        m.METRIC_WEBHOOK_QUEUED.labels(tier=str(tier_val)).inc()
-        log(f"[Webhook 차단] {namespace}/{pr_name} ({ptype}/{match_info}, Tier {tier_val}) "
-            f"-> 쿼터 초과(Running:{effective_running} >= Limit:{limit}). 대기열로 보냅니다.")
-        patch = [{"op": "add", "path": "/spec/status", "value": "PipelineRunPending"}]
-        patch += _label_patch(metadata.get("labels"),
-                              {TIER_LABEL_KEY: str(tier_val), MANAGED_LABEL_KEY: MANAGED_LABEL_VAL})
-        return _admission_patch_response(uid, patch)
-
-    # generateName PR은 이름이 확정되지 않아 phantom entry 삽입 스킵
-    pr_real_name = metadata.get('name')
-    if pr_real_name:
-        pr_key = f"{namespace}/{pr_real_name}"
-        phantom_labels = dict(labels)
-        phantom_labels[TIER_LABEL_KEY] = str(tier_val)
-        phantom_entry = {
-            'metadata': {
-                'namespace': namespace,
-                'name': pr_real_name,
-                'labels': phantom_labels,
-                'creationTimestamp': datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                'resourceVersion': '__admitted__',
-            },
-            'spec': {'status': None},
-            'status': {},
-        }
-        with cache_lock:
-            if pr_key not in local_cache:
-                local_cache[pr_key] = phantom_entry
-
-    m.METRIC_WEBHOOK_ADMITTED.labels(tier=str(tier_val)).inc()
-    log(f"[Webhook 통과] {namespace}/{pr_name} ({ptype}/{match_info}, Tier {tier_val}) "
-        f"-> 즉시 실행 허용 (Running:{effective_running + 1}/{limit})")
-
-    patch = _label_patch(metadata.get("labels"), {TIER_LABEL_KEY: str(tier_val)})
+    # ── 인가 주체 단일화 ────────────────────────────────────────────
+    # 이전 구현은 슬롯이 있으면 웹훅이 그 자리에서 인가하고, 없으면 대기열로 보냈다.
+    # 웹훅은 요청마다 독립적으로 실행되므로 동시 인가 요청이 들어오면 각 요청이
+    # 자기 시점의 running 수와 admitted 카운터를 보고 판정한다. 카운터가 감소하는
+    # 시점과 그 건이 running 수에 반영되는 시점이 어긋나는 창에서 슬롯이 비어 보이고,
+    # 매니저까지 대기열을 풀면서 상한이 깨진다.
+    #   실측: 동시 12요청에서 상한 30 에 대해 최대 48 까지 올라갔고 초과가 872초 지속됐다.
+    #   직렬 도착(초당 4건)에서는 재현되지 않는다.
+    #
+    # 웹훅은 판정하지 않는다. 항상 대기열(PipelineRunPending)에 넣고 인가는 매니저
+    # 루프가 전담한다. 인가 결정이 한 곳에서 직렬로 일어나므로 경쟁이 성립하지 않으며,
+    # 매니저는 한 사이클에서 푼 건수를 세어 남은 슬롯을 차감한다.
+    #   대가: 슬롯이 비어 있어도 다음 매니저 사이클까지 대기한다(최대 약 5초).
+    m.METRIC_WEBHOOK_QUEUED.labels(tier=str(tier_val)).inc()
+    log(f"[Webhook 대기열] {namespace}/{pr_name} ({ptype}/{match_info}, Tier {tier_val}) "
+        f"-> 대기열 등록 (Running:{running_cnt}/{limit}). 인가는 매니저가 수행합니다.")
+    patch = [{"op": "add", "path": "/spec/status", "value": "PipelineRunPending"}]
+    patch += _label_patch(metadata.get("labels"),
+                          {TIER_LABEL_KEY: str(tier_val), MANAGED_LABEL_KEY: MANAGED_LABEL_VAL})
     return _admission_patch_response(uid, patch)
 
 

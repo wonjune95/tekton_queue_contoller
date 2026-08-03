@@ -110,8 +110,12 @@ class TestMutateHold:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class TestMutateAdmit:
     @patch('src.cache.core_api')
-    def test_dashboard_admit_no_pending_status(self, mock_api, flask_client):
-        """쿼터 여유 → Pending 없이 즉시 실행."""
+    def test_dashboard_always_queued(self, mock_api, flask_client):
+        """관리 대상은 쿼터 여유와 무관하게 항상 대기열(Pending)로 간다.
+
+        웹훅은 인가를 판정하지 않는다. 요청마다 독립 실행되므로 동시 인가 요청에서
+        상한이 깨졌다(동시 12요청, 상한 30 → 최대 48). 인가는 매니저가 단독 수행한다.
+        """
         state.initial_sync_done = True
         cm = MagicMock()
         cm.data = {'admitted': '0'}
@@ -119,8 +123,9 @@ class TestMutateAdmit:
         req = make_admission_request(labels={"env": "prod"})
         resp = flask_client.post('/mutate', json=req, content_type='application/json')
         patches = _decode_patch(resp.data)
-        has_pending = any(p.get('value') == 'PipelineRunPending' for p in patches)
-        assert has_pending is False
+        assert any(p.get('value') == 'PipelineRunPending' for p in patches),             "관리 대상은 항상 Pending 이어야 한다"
+        managed_key = config.MANAGED_LABEL_KEY.replace("/", "~1")
+        assert any(managed_key in p.get('path', '') for p in patches),             "managed 라벨이 없으면 매니저가 스케줄링 대상으로 보지 않는다"
 
     @patch('src.cache.core_api')
     def test_dashboard_admit_adds_tier_label(self, mock_api, flask_client):
@@ -137,16 +142,19 @@ class TestMutateAdmit:
         assert tier_patches[0]['value'] == '2'  # stg = Tier 2
 
     @patch('src.cache.core_api')
-    def test_phantom_entry_inserted(self, mock_api, flask_client):
-        """즉시 실행 시 phantom entry가 캐시에 삽입."""
+    def test_no_phantom_entry(self, mock_api, flask_client):
+        """phantom entry 를 더 이상 삽입하지 않는다.
+
+        phantom 은 웹훅이 즉시 인가한 건을 캐시에 미리 넣어 슬롯을 예약하던 장치다.
+        웹훅이 인가하지 않게 되면서 예약할 대상 자체가 없어졌다.
+        """
         state.initial_sync_done = True
         cm = MagicMock()
         cm.data = {'admitted': '0'}
         mock_api.read_namespaced_config_map.return_value = cm
         req = make_admission_request(name="real-pr", labels={"env": "dev"})
         flask_client.post('/mutate', json=req, content_type='application/json')
-        assert "test-cicd/real-pr" in cache.local_cache
-        assert cache.local_cache["test-cicd/real-pr"]['metadata']['resourceVersion'] == '__admitted__'
+        assert "test-cicd/real-pr" not in cache.local_cache
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -292,7 +300,8 @@ class TestManagedSAPatternsFnmatch:
             username="system:serviceaccount:tekton-pipelines:tekton-dashboard")
         resp = flask_client.post('/mutate', json=req, content_type='application/json')
         patches = _decode_patch(resp.data)
-        assert not any(p.get('value') == 'PipelineRunPending' for p in (patches or []))
+        # 관리 대상 출처 → 대기열 등록(Pending). 인가는 매니저가 한다.
+        assert any(p.get('value') == 'PipelineRunPending' for p in (patches or []))
 
     def test_wildcard_pattern_excludes_other_namespace(self, flask_client):
         """다른 네임스페이스의 SA는 와일드카드 패턴에 매칭되지 않아 보류 처리된다."""
@@ -319,7 +328,8 @@ class TestManagedSAPatternsFnmatch:
             username="system:serviceaccount:ci:ci-runner")
         resp = flask_client.post('/mutate', json=req, content_type='application/json')
         patches = _decode_patch(resp.data)
-        assert not any(p.get('value') == 'PipelineRunPending' for p in (patches or []))
+        # 관리 대상 출처 → 대기열 등록(Pending). 인가는 매니저가 한다.
+        assert any(p.get('value') == 'PipelineRunPending' for p in (patches or []))
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
