@@ -4,7 +4,7 @@
 
 **다수의 네임스페이스에 걸친 Tekton PipelineRun의 전역 동시 실행 수를 통제하고, 우선순위 기반으로 스케줄링하는 Kubernetes Admission Webhook 컨트롤러**
 
-[![Tests](https://img.shields.io/badge/tests-168%20passed-2ea44f?logo=pytest&logoColor=white)](#13-검증-verification)
+[![Tests](https://img.shields.io/badge/tests-133%20passed-2ea44f?logo=pytest&logoColor=white)](#13-검증-verification)
 [![Integration](https://img.shields.io/badge/integration%20S1~S4-passed-2ea44f?logo=kubernetes&logoColor=white)](#13-검증-verification)
 [![Python](https://img.shields.io/badge/python-3.11-3776AB?logo=python&logoColor=white)](docker/Dockerfile)
 [![Kubernetes](https://img.shields.io/badge/kubernetes-1.20%2B-326CE5?logo=kubernetes&logoColor=white)](#71-사전-요구사항)
@@ -21,9 +21,9 @@
 Tekton Pipelines에는 **클러스터 전역 동시 실행 제한이 없어**, 대량 배포가 몰리면 자원 경쟁으로 OOM·노드 장애가 발생합니다. 이 컨트롤러는 API Server 인입 단계(Admission Webhook)에서 이를 선제 통제합니다.
 
 - **외부 락 스토리지 0** — Redis·ZooKeeper 없이 K8s 네이티브 프리미티브(Lease 기반 Leader Election)만으로 전역 쿼터 정합성을 확보. 인가 결정은 Leader의 매니저 루프 한 곳에서만 일어납니다
-- **비파괴적 제어 + 우선순위** — 쿼터 초과 PR을 삭제/재생성 없이 `PipelineRunPending` 주입으로 보류하고, 티어 + 에이징으로 스케줄링해 기아(starvation)를 방지
-- **HA + 자가 치유** — Lease 기반 Leader Election으로 ~15초 내 Failover, 카운터 누수는 Manager OR-게이트가 30초 내 자동 보정(결과적 정합성)
-- **검증됨** — 168개 단위 테스트 통과 + 실클러스터 시나리오에서 동시 실행이 한도를 초과하지 않음(직렬·동시 도착 모두)
+- **비파괴적 제어 + 우선순위** — 삭제/재생성 없이 `PipelineRunPending` 주입으로 대기열에 넣고, 티어 + 에이징으로 스케줄링해 기아(starvation)를 방지
+- **HA** — Lease 기반 Leader Election으로 ~15초 내 Failover. 인가는 Leader의 Manager 루프에서만 일어나므로 Failover 중에도 중복 인가가 없습니다
+- **검증됨** — 133개 단위 테스트 통과 + 실클러스터에서 동시 실행이 한도를 초과하지 않음(직렬·동시 도착 모두)
 
 > 왜 Go가 아니라 Python인지는 [§3 핵심 설계 결정](#-핵심-설계-결정-key-design-decisions)에서 다룹니다.
 
@@ -78,7 +78,7 @@ Tekton Pipelines는 클러스터 전체 단위의 동시 실행 개수를 제한
 
 ### 2.0. 전체 흐름 한눈에 보기
 
-PipelineRun 생성부터 실행까지의 전체 경로 — ① Admission Webhook(쿼터 판정) → ② Controller Pod(캐시·스케줄링·자가 치유) → ③ HA(Leader Election)를 한 장으로 정리한 그림입니다. 인가 결정이 어디서 일어나는지는 [§12](#12-인가-경로-admission-path)에서 다룹니다.
+PipelineRun 생성부터 실행까지의 전체 경로 — ① Admission Webhook(대기열 등록) → ② Controller Pod(캐시·인가·스케줄링) → ③ HA(Leader Election)를 한 장으로 정리한 그림입니다. 인가 결정이 어디서 일어나는지는 [§12](#12-인가-경로-admission-path)에서 다룹니다.
 
 <div align="center">
   <img src="docs/images/workflow.png" alt="Tekton Queue Controller 전체 워크플로우" width="900"/>
@@ -212,11 +212,11 @@ sequenceDiagram
 | 문제 | 선택한 설계 | 대안 대비 이점 |
 |------|-------------|----------------|
 | 다중 Pod 간 전역 쿼터 정합성 | 인가 결정을 매니저 루프 한 곳으로 단일화 (Leader만 수행) | 분산 락·외부 스토리지 불필요 → 인프라 의존성 0 ([§2.1](#21-요청-처리-흐름)) |
-| 쿼터 초과 PR 처리 | Admission 단계에서 `PipelineRunPending` 주입 | PR 강제 삭제/재생성 없는 비파괴적 제어 |
+| 대기열 진입 | Admission 단계에서 `PipelineRunPending` 주입 (쿼터와 무관하게 항상) | PR 강제 삭제/재생성 없는 비파괴적 제어 |
 | 고가용성 | K8s Lease 기반 Leader Election | ZooKeeper 등 외부 코디네이터 직접 운영 불필요 |
 
 > **왜 Go(controller-runtime)가 아니라 Python인가?**
-> 이 컨트롤러의 정합성·HA 보장은 프레임워크가 아니라 **K8s 네이티브 프리미티브**(ConfigMap `resourceVersion` 낙관적 락, Lease)에 있습니다 — 즉 correctness가 언어에 독립적입니다. 덕분에 controller-runtime의 무게 없이, leader/manager/watcher가 하나의 인메모리 캐시를 공유하는 **단일 경량 프로세스**로 단순하게 유지됩니다. 이 공유 캐시 모델 때문에 멀티프로세스는 정합성을 깨뜨리므로, Gunicorn을 `workers=1` + `threads=8` 스레드 동시성으로 **의도적으로 고정**했습니다([§10.1](#101-dockerfile-구조)).
+> 이 컨트롤러의 정합성·HA 보장은 프레임워크가 아니라 **K8s 네이티브 프리미티브**(Lease 기반 Leader Election)와 **단일 인가 지점** 설계에 있습니다 — 즉 correctness가 언어에 독립적입니다. 덕분에 controller-runtime의 무게 없이, leader/manager/watcher가 하나의 인메모리 캐시를 공유하는 **단일 경량 프로세스**로 단순하게 유지됩니다. 이 공유 캐시 모델 때문에 멀티프로세스는 정합성을 깨뜨리므로, Gunicorn을 `workers=1` + `threads=8` 스레드 동시성으로 **의도적으로 고정**했습니다([§10.1](#101-dockerfile-구조)).
 
 ### 🔒 보안 가드레일
 
@@ -432,7 +432,7 @@ kubectl exec -n tekton-pipelines <pod-name> -- curl -sk https://localhost:8443/h
 | `tekton_queue_running_total` | Gauge | - | 현재 실행 중인 파이프라인 수 |
 | `tekton_queue_pending_total` | Gauge | `tier` | 대기열 파이프라인 수 (Tier별) |
 | `tekton_queue_webhook_admitted_total` | Counter | `tier` | (구버전 지표) 웹훅이 직접 인가하던 시절의 허용 횟수. 현재는 증가하지 않음 |
-| `tekton_queue_webhook_queued_total` | Counter | `tier` | Dashboard PR 쿼터 초과 대기열 진입 횟수 |
+| `tekton_queue_webhook_queued_total` | Counter | `tier` | Dashboard PR 대기열 진입 횟수 |
 | `tekton_queue_webhook_held_total` | Counter | `tier` | Dashboard 외 출처 PR 보류 횟수 |
 | `tekton_queue_scheduled_total` | Counter | `tier` | Manager 스케줄링 횟수 |
 | `tekton_queue_kubernetes_api_errors_total` | Counter | `operation` | K8s API 에러 횟수 |
@@ -628,7 +628,7 @@ make lint        # = flake8 src/ tests/ --max-line-length=120
 make simulate    # S1~S4 스케줄링 로직 시뮬레이션 (K8s 불필요)
 ```
 
-**158 passed** — Webhook 동시성·Leader Election·Watcher 재동기화·Tier 분류·self-healing OR-게이트 등 포함.
+**133 passed** — Webhook 대기열 등록·Leader Election·Watcher 재동기화·Tier 분류·Manager 스케줄링 등 포함.
 
 ### 13.2. 통합 테스트 (실 클러스터, S1~S4)
 
@@ -656,7 +656,6 @@ python -m tests.integration_scenarios
 - **CRD 변경 반영 지연:** GlobalLimit CRD 변경 시 최대 5초의 반영 지연이 있습니다.
 - **HA Failover 지연:** Leader 장애 시 최대 ~15초의 스케줄링 공백이 발생합니다. 이 동안 Webhook은 모든 Pod에서 정상 처리됩니다.
 - **관리 SA 패턴 변경 시 재배포 필요:** `MANAGED_SA_PATTERNS` 환경변수 변경은 Pod 재시작이 필요합니다. SA 패턴 추가는 `spec.managedSAPatterns` 배열에 항목을 추가하면 재배포 없이 반영됩니다.
-- **self-healing 관측성:** 자가 치유 발동은 현재 **로그로만** 기록됩니다. SRE 알람 연동을 위한 전용 Prometheus 카운터(예: `tekton_queue_self_healing_total`) 노출은 향후 과제입니다.
 
 ---
 
