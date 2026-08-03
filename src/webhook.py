@@ -7,8 +7,9 @@ import json
 import base64
 import fnmatch
 import datetime
+import time
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, g
 
 from src.config import (
     TIER_LABEL_KEY, MANAGED_LABEL_KEY, MANAGED_LABEL_VAL,
@@ -24,6 +25,21 @@ from src import metrics as m
 from src import state
 
 app = Flask(__name__)
+
+
+# ─── /mutate 지연 계측 (§3.4 제어 계층 부하: p50/p99) ──────────
+@app.before_request
+def _webhook_timer_start():
+    g._webhook_start = time.perf_counter()
+
+
+@app.after_request
+def _webhook_timer_observe(response):
+    if request.path == '/mutate':
+        start = getattr(g, '_webhook_start', None)
+        if start is not None:
+            m.METRIC_WEBHOOK_LATENCY.observe(time.perf_counter() - start)
+    return response
 
 
 # ─── Health 엔드포인트 ─────────────────────────────────────────

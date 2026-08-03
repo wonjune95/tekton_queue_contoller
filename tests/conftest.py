@@ -35,6 +35,7 @@ def _reset_global_state():
         "tier_rules":          config.DEFAULT_TIER_RULES,
         "namespace_patterns":  list(config.DEFAULT_NAMESPACE_PATTERNS),
         "managed_sa_patterns": list(config.MANAGED_SA_PATTERNS),
+        "disable_admitted_counter": config.DEFAULT_DISABLE_ADMITTED_COUNTER,
     })
     yield
     state.is_leader = False

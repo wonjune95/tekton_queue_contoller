@@ -68,6 +68,16 @@ def _ensure_admitted_configmap():
 
 def _try_increment_global_admitted(running_cnt: int, limit: int, max_retries: int = 5):
     global webhook_admitted_count
+
+    # A1′ (카운터 격리 조건, 에이블레이션 전용):
+    # disableAdmittedCounter=true 이면 admitted 추적을 비활성화하고 running 수만으로 슬롯을
+    # 판정한다. Watch 인포머 지연 창에서 running_cnt 가 실제 승인 수를 따라가지 못해
+    # 순간 상한 초과(L_max+δ)가 노출된다. 평시에는 사용하지 않는다.
+    if get_cached_config().get("disable_admitted_counter", False):
+        if running_cnt >= limit:
+            return False, running_cnt
+        return True, running_cnt
+
     for _ in range(max_retries):
         try:
             cm = core_api.read_namespaced_config_map(ADMITTED_CM_NAME, LEASE_NAMESPACE)

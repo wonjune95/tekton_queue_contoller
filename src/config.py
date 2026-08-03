@@ -17,6 +17,7 @@ DEFAULT_NAMESPACE_PATTERNS = ["*-cicd"]
 DEFAULT_LIMIT = 10
 DEFAULT_AGING_INTERVAL_SEC = 180
 DEFAULT_AGING_MIN_TIER = 1
+DEFAULT_DISABLE_ADMITTED_COUNTER = False
 DEFAULT_TIER = 3
 DEFAULT_TIER_RULES = [
     {"tier": 0, "matchType": "label", "labelKey": "queue.tekton.dev/urgent",
@@ -57,6 +58,7 @@ crd_config: dict = {
     "tier_rules":          DEFAULT_TIER_RULES,
     "namespace_patterns":  list(DEFAULT_NAMESPACE_PATTERNS),
     "managed_sa_patterns": list(MANAGED_SA_PATTERNS),
+    "disable_admitted_counter": DEFAULT_DISABLE_ADMITTED_COUNTER,
 }
 crd_config_lock = threading.Lock()
 
@@ -91,6 +93,8 @@ def load_crd_config() -> int:
             "tier_rules":          spec.get('tierRules') or DEFAULT_TIER_RULES,
             "namespace_patterns":  resolved_patterns,
             "managed_sa_patterns": spec.get('managedSAPatterns') or list(MANAGED_SA_PATTERNS),
+            "disable_admitted_counter": bool(spec.get('disableAdmittedCounter',
+                                                       DEFAULT_DISABLE_ADMITTED_COUNTER)),
         }
         with crd_config_lock:
             crd_config.update(new_cfg)

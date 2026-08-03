@@ -5,7 +5,9 @@ metadata:
 spec:
   namespacePatterns:
     - "*-cicd"
-  maxPipelines: 10
+  # L_max — 논문 §3 파라미터 표와 일치시킬 것(현재 30). 로컬 PoC 값(10)을 그대로 두면
+  # 캠페인이 논문과 다른 상한으로 돌아간다(2026-07-29 GKE 설치 중 발견).
+  maxPipelines: 30
   managedSAPatterns:
     - "system:serviceaccount:tekton-pipelines:tekton-dashboard"
   agingIntervalSec: 300

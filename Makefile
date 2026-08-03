@@ -4,16 +4,28 @@
 IMAGE_NAME   ?= tekton-queue-controller
 IMAGE_TAG    ?= local
 CLUSTER_NAME ?= tekton-test
+# GKE 푸시용: 예) asia-northeast3-docker.pkg.dev/<PROJECT>/tekton-queue  (make push 시 지정)
+REGISTRY     ?=
+IMAGE_REF     = $(if $(REGISTRY),$(REGISTRY)/$(IMAGE_NAME):$(IMAGE_TAG),$(IMAGE_NAME):$(IMAGE_TAG))
 
-.PHONY: build load deploy test simulate kind-setup kind-test lint clean help
+.PHONY: build load push deploy test simulate kind-setup kind-test lint clean help
 
-## Docker 이미지 빌드
+## Docker 이미지 빌드 (로컬)
 build:
 	docker build -t $(IMAGE_NAME):$(IMAGE_TAG) -f docker/Dockerfile .
 
 ## Kind 클러스터에 이미지 로드
 load: build
 	kind load docker-image $(IMAGE_NAME):$(IMAGE_TAG) --name $(CLUSTER_NAME)
+
+## 레지스트리로 빌드·푸시 (GKE용). REGISTRY·IMAGE_TAG 지정 필수.
+##   예: make push REGISTRY=asia-northeast3-docker.pkg.dev/PROJECT/tekton-queue IMAGE_TAG=v0.2.0
+push:
+	@test -n "$(REGISTRY)" || { echo "REGISTRY 를 지정하세요 (예: make push REGISTRY=<REGION>-docker.pkg.dev/<PROJECT>/tekton-queue IMAGE_TAG=v0.2.0)"; exit 1; }
+	docker build -t $(IMAGE_REF) -f docker/Dockerfile .
+	docker push $(IMAGE_REF)
+	@echo ">>> 푸시 완료: $(IMAGE_REF)"
+	@echo ">>> deploy.yaml 이미지 교체 후 배포하세요 (CLAUDE.md '자주 쓰는 명령' 참조)."
 
 ## Kubernetes 리소스 배포 (install/ 디렉터리 기준)
 deploy:

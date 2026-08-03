@@ -1,0 +1,30 @@
+# 큐 컨트롤러 메트릭을 Prometheus 가 수집하도록 등록한다.
+#
+# 없으면 컨트롤러가 /metrics 를 정상 노출해도 **아무도 긁지 않아** 다음 지표가 통째로 비게 된다:
+#   tekton_queue_webhook_latency_seconds_bucket  (논문 웹훅 지연 p50/p99)
+#   tekton_queue_running_total / tekton_queue_limit / tekton_queue_webhook_admitted_total
+#   tekton_queue_kubernetes_api_errors_total
+# 2026-07-29 dry-run(`resource_collect.py --check`)에서 0 시리즈로 발견.
+#
+# ※ label `release: kps` 는 필수다. kube-prometheus-stack 의 Prometheus CR 이
+#   serviceMonitorSelector={matchLabels:{release: kps}} 로 대상을 고른다.
+#   helm 릴리스명을 kps 가 아닌 것으로 바꾸면 이 라벨도 함께 바꿔야 한다.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: tekton-queue-controller
+  namespace: tekton-pipelines
+  labels:
+    release: kps
+spec:
+  selector:
+    matchLabels:
+      app: tekton-queue
+  namespaceSelector:
+    matchNames:
+    - tekton-pipelines
+  endpoints:
+  - port: metrics          # Service 의 named port (9090)
+    path: /metrics
+    interval: 5s           # 웹훅 지연·동시 실행 수를 촘촘히 남기기 위해 기본(30s)보다 짧게
+    scrapeTimeout: 5s

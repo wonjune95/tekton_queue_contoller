@@ -54,6 +54,53 @@ def print_dashboard(limit: int, running_cnt: int, pending_list: list, cfg: dict)
     log("=" * 60)
 
 
+# ── 유효 Tier 승격 이벤트 로그 (W_max 직접 검증 + 역전 기전 그림 소스) ──
+# PR별 마지막 관측 유효 Tier. 매 사이클 재계산해 감소(=승격) 시점을 기록한다.
+_last_eff_tier: dict = {}
+
+
+def detect_and_log_promotions(pending: list, cfg: dict, now=None) -> None:
+    """대기 중 PR의 유효 Tier 전이를 감지해 로그·메트릭으로 남긴다.
+
+    유효 Tier가 낮아지는 것이 '승격'(우선순위 상승)이다. enqueue~승격 시각으로
+    W_max 상한을 실측하고, 승격 타임라인이 Tier 간 역전 기전 그림의 소스가 된다.
+    now 주입 가능(테스트용).
+    """
+    if now is None:
+        now = datetime.datetime.now(datetime.timezone.utc)
+    aging_interval = cfg["aging_interval_sec"]
+    aging_min      = cfg["aging_min_tier"]
+    current_keys = set()
+
+    for item in pending:
+        ns   = item['metadata']['namespace']
+        name = item['metadata'].get('name') or item['metadata'].get('generateName', '') + "(gen)"
+        key  = f"{ns}/{name}"
+        current_keys.add(key)
+        labels = item['metadata'].get('labels') or {}
+        try:
+            orig = int(labels.get(TIER_LABEL_KEY, DEFAULT_TIER))
+        except (ValueError, TypeError):
+            orig = DEFAULT_TIER
+        created = parse_k8s_timestamp(item['metadata'].get('creationTimestamp', ''))
+        wait    = (now - created).total_seconds()
+        eff     = effective_tier(orig, wait, aging_interval, aging_min)
+
+        prev = _last_eff_tier.get(key)
+        if prev is None:
+            _last_eff_tier[key] = eff
+        elif eff < prev:  # 승격(유효 Tier 감소)
+            env_val = labels.get(ENV_LABEL_KEY, '?')
+            log(f"[승격] {ns}/{name} Tier {prev}->{eff} (대기 {int(wait)}s, env:{env_val})")
+            m.METRIC_PROMOTION.labels(from_tier=str(prev), to_tier=str(eff)).inc()
+            _last_eff_tier[key] = eff
+
+    # 더 이상 대기열에 없는(스케줄/완료/삭제된) PR 정리 — 누수 방지
+    for k in list(_last_eff_tier.keys()):
+        if k not in current_keys:
+            del _last_eff_tier[k]
+
+
 # admitted 쿼터 누수 자가 치유(self-healing) 임계 시간(초).
 # 실행 중 PR이 0개인데 admitted 카운터가 계속 양수로 남아있는 비정상 상태가
 # 이 시간 이상 지속되면 카운터를 0으로 강제 보정한다.
@@ -77,6 +124,9 @@ def manager_loop():
             limit          = load_crd_config()
             cfg            = get_cached_config()
             running, pending = get_queue_status_from_cache()
+
+            # 유효 Tier 승격 이벤트 기록 (매 사이클)
+            detect_and_log_promotions(pending, cfg)
 
             # 로그 폭주 방지: pending이 있어도 30초마다(유휴 시 60초마다)만 대시보드 출력
             elapsed = time.time() - last_log_time

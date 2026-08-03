@@ -46,7 +46,14 @@ kind: Service
 metadata:
   name: tekton-queue-controller
   namespace: tekton-pipelines
+  labels:
+    # ※ ServiceMonitor(install/servicemonitor.yaml)의 selector 가 **Service 라벨**을 본다.
+    #   이 라벨이 없으면 ServiceMonitor 를 만들어도 대상이 0개가 되어 메트릭이 수집되지 않는다
+    #   (2026-07-29 dry-run 에서 발견).
+    app: tekton-queue
   annotations:
+    # 아래 prometheus.io/* 는 **구식 스크레이프 설정(kubernetes_sd + relabel)용**이며
+    # kube-prometheus-stack(Prometheus Operator)은 이를 보지 않는다. 실제 수집은 ServiceMonitor 로 한다.
     prometheus.io/scrape: "true"
     prometheus.io/scheme: "http"
     prometheus.io/path: "/metrics"

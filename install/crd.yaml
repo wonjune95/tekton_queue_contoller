@@ -40,6 +40,10 @@ spec:
                   type: integer
                   default: 1
                   description: "에이징으로 도달 가능한 최소 Tier (0은 긴급 전용)"
+                disableAdmittedCounter:
+                  type: boolean
+                  default: false
+                  description: "true 시 admitted 카운터를 비활성화하고 running 수만으로 슬롯을 판정한다(에이블레이션 A1′: watch 지연 창의 순간 상한 초과 측정용). 평시 false."
                 managedSAPatterns:
                   type: array
                   description: "큐가 관리하는 SA 패턴 목록 (fnmatch 문법). 미설정 시 MANAGED_SA_PATTERNS 환경변수 또는 기본값 사용."

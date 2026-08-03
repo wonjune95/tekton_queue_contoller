@@ -20,8 +20,9 @@ fi
 
 # ── 2. Tekton Pipelines 설치 ──────────────────────────────────────
 echo ">>> [2/6] Tekton Pipelines 설치"
+# ※ GCS 버킷 경로는 404, `latest` 는 낡은 v1.6.0 을 가리킨다. GitHub 릴리스 자산 + 버전 고정을 쓸 것.
 kubectl apply --filename \
-  https://storage.googleapis.com/tekton-releases/pipeline/latest/release.yaml
+  "https://github.com/tektoncd/pipeline/releases/download/${TEKTON_VERSION:-v1.9.2}/release.yaml"
 
 echo "    Tekton Controller 준비 대기 중..."
 kubectl wait --for=condition=available --timeout=120s \
@@ -47,13 +48,19 @@ DNS.1 = ${SVC_FQDN}
 DNS.2 = ${SVC_FQDN}.cluster.local
 EOF
 
+# Git Bash(MSYS/Cygwin)는 "/CN=..." 를 Windows 경로로 변환한다 → 슬래시 하나 더 붙여 이스케이프.
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) SUBJ="//CN=${SVC_FQDN}" ;;
+  *)                    SUBJ="/CN=${SVC_FQDN}"  ;;
+esac
+
 openssl genrsa -out "${TLS_DIR}/ca.key" 2048 2>/dev/null
 openssl req -new -x509 -days 365 -key "${TLS_DIR}/ca.key" \
-  -subj "/CN=${SVC_FQDN}" -out "${TLS_DIR}/ca.crt" 2>/dev/null
+  -subj "$SUBJ" -out "${TLS_DIR}/ca.crt"
 
 openssl genrsa -out "${TLS_DIR}/tls.key" 2048 2>/dev/null
 openssl req -new -key "${TLS_DIR}/tls.key" \
-  -subj "/CN=${SVC_FQDN}" -out "${TLS_DIR}/tls.csr" 2>/dev/null
+  -subj "$SUBJ" -out "${TLS_DIR}/tls.csr"
 openssl x509 -req -days 365 \
   -in  "${TLS_DIR}/tls.csr" \
   -CA  "${TLS_DIR}/ca.crt" -CAkey "${TLS_DIR}/ca.key" -CAcreateserial \
