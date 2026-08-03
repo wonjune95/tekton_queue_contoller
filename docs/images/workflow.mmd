@@ -1,43 +1,38 @@
 %%{init: {'theme':'base','themeVariables':{'fontSize':'15px','primaryColor':'#eef4ff','primaryBorderColor':'#0969da','lineColor':'#57606a','clusterBkg':'#f6f8fa','clusterBorder':'#d0d7de'}}}%%
 flowchart TB
-    classDef admit fill:#2ea44f,stroke:#1a7f37,color:#fff;
     classDef run fill:#1f883d,stroke:#116329,color:#fff,stroke-width:2px;
     classDef queue fill:#d29922,stroke:#9a6700,color:#fff;
     classDef hold fill:#6e7781,stroke:#424a53,color:#fff;
-    classDef heal fill:#8250df,stroke:#6639ba,color:#fff;
     classDef dec fill:#ddf4ff,stroke:#0969da,color:#0a3069;
+    classDef gate fill:#8250df,stroke:#6639ba,color:#fff,stroke-width:2px;
 
     DB(["👤 Dashboard / CI — PipelineRun CREATE"])
 
-    subgraph S1["① Admission Webhook · 모든 Pod (인입 즉시 판정)"]
+    subgraph S1["① Admission Webhook · 모든 Pod (인가를 판정하지 않음)"]
         direction TB
         WH{"대상 NS &amp;<br/>Dashboard SA 출처?"}
-        Q{"running + admitted &lt; limit ?<br/>— admitted: 공용 ConfigMap 낙관적 락"}
-        WH -->|"Yes"| Q
     end
 
     DB --> WH
     WH -->|"No · CI/배스천"| HOLD["⬛ 영구 Pending<br/>managed 라벨 없음<br/>→ 스케줄링 영구 제외"]
-    Q  -->|"No · 쿼터 초과"| QUEUE["🟨 일시 Pending<br/>managed 라벨 부여<br/>→ 대기열 진입"]
-    Q  -->|"Yes · 슬롯 여유"| ADMIT["🟩 admitted +1<br/>phantom 캐시 삽입<br/>→ 즉시 실행 허용"]
+    WH -->|"Yes"| QUEUE["🟨 Pending + managed 라벨<br/>Tier 라벨 주입<br/>→ 대기열 진입 (쿼터와 무관)"]
 
     subgraph S2["② Controller Pod · Leader 전용 (5초 주기)"]
         direction TB
-        MGR["⚙️ Manager<br/>Tier 정렬 + Aging<br/>→ 빈 슬롯만큼 실행 패치"]
-        HEAL["🩹 Self-heal (Manager 인라인)<br/>admitted 누수 30s 지속 → 0 보정"]
-        MGR -. "running=0 또는 starvation" .-> HEAL
+        SLOT["📊 빈 슬롯 = 상한 − 실행 중<br/>캐시의 running 수만 사용"]
+        MGR["⚙️ Manager<br/><b>유일한 인가 지점</b><br/>Tier 정렬 + Aging<br/>→ 빈 슬롯만큼 실행 패치"]
+        SLOT --> MGR
+        MGR -. "실행시킨 건수만큼 슬롯 차감<br/>사이클 내 초과 방지" .-> SLOT
     end
 
-    QUEUE -->|"대기열에서 선발"| MGR
-    ADMIT --> RUN(["🚀 PipelineRun 실행 시작"])
-    MGR   -->|"slot 확보 시 spec.status=null"| RUN
+    QUEUE -->|"대기열에서 선발"| SLOT
+    MGR --> RUN(["🚀 PipelineRun 실행 시작"])
 
-    HA(["③ HA · Leader Election<br/>Lease renew 2s / duration 15s<br/>Leader Pod만 Manager 동작"])
+    HA(["③ HA · Leader Election<br/>Lease renew 2s / duration 15s<br/>Leader Pod만 Manager 동작<br/>→ 인가 지점이 항상 하나"])
     HA -. 보장 .- MGR
 
-    class WH,Q dec;
-    class ADMIT admit;
+    class WH dec;
     class RUN run;
     class QUEUE queue;
     class HOLD hold;
-    class HEAL heal;
+    class MGR gate;
