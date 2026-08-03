@@ -126,10 +126,7 @@ flowchart TD
 flowchart TD
     L([Manager Loop<br/>5초 주기 · Leader Pod 전용]) --> CFG[GlobalLimit CRD 로드<br/>Limit / Aging / TierRules / NS Patterns]
     CFG --> ST[캐시 상태 조회<br/>Running 수 + Managed Pending 목록]
-    ST --> SH{"running=0 &amp; admitted&gt;0<br/>또는 starvation?"}
-    SH -- "30s 지속" --> HEAL[admitted 카운터<br/>자가 보정 → 0]
-    SH -- No --> AVAIL
-    HEAL --> AVAIL{"available_slots &gt; 0<br/>&amp;&amp; pending 존재?"}
+    ST --> AVAIL{"available_slots &gt; 0<br/>&amp;&amp; pending 존재?"}
     AVAIL -- No --> WAIT[대기 5초 후 재확인]
     AVAIL -- Yes --> SORT[Pending 정렬<br/>effective_tier ASC → creationTimestamp FIFO + Aging]
     SORT --> RUN([빈 슬롯만큼 spec.status=null 패치<br/>→ 실행 시작])
@@ -137,9 +134,7 @@ flowchart TD
     RUN --> L
 
     classDef run fill:#2ea44f,stroke:#1a7f37,color:#fff;
-    classDef heal fill:#8250df,stroke:#6639ba,color:#fff;
     class RUN run;
-    class HEAL heal;
 ```
 
 ### 2.3. HA (Leader Election) 워크플로우
@@ -207,7 +202,7 @@ sequenceDiagram
 | **기아 방지** | 대기 시간 기반 에이징으로 effective tier 자동 승격 | 낮은 우선순위 파이프라인의 무기한 대기 방지 |
 | **대기열 정합성** | `creationTimestamp` 기준 정렬 (FIFO) | Pod 재시작 시 순서 보장 |
 | **취소/중지 처리** | `Cancelled`, `CancelledRunFinally`, `StoppedRunFinally` 상태 감지 | 취소된 파이프라인의 슬롯 즉시 반환 |
-| **Race Condition 방어** | `webhook_admitted_count`로 Webhook-Watcher 간 정합성 유지 | 동시 CREATE 시 쿼터 초과 방지 |
+| **Race Condition 방어** | 인가 결정을 매니저 루프 한 곳으로 단일화 (Leader 전용) | 동시 CREATE 시에도 상한 초과 없음 |
 | **고가용성** | Kubernetes Lease 기반 Leader Election | Leader 장애 시 ~15초 내 자동 Failover |
 
 ### 💡 핵심 설계 결정 (Key Design Decisions)
@@ -566,7 +561,7 @@ tekton_queue_controller/
 │   ├── __init__.py
 │   ├── state.py            # Global 공유 상태 자원
 │   ├── config.py           # CRD 설정 로드 및 환경변수
-│   ├── cache.py            # 인메모리 PR 캐시 및 Admitted 카운터 제어
+│   ├── cache.py            # 인메모리 PR 캐시 (Watch 인포머가 채움)
 │   ├── metrics.py          # Prometheus 메트릭 정의
 │   ├── webhook.py          # Flask 기반 Mutating Webhook API
 │   └── workers/            # 백그라운드 Worker 스레드
@@ -658,11 +653,9 @@ python -m tests.integration_scenarios
 ## 14. 설계 한계 및 향후 과제
 
 - **비선점형 설계:** 실행 중인 낮은 티어 파이프라인의 선점은 지원하지 않습니다. 우선순위 정렬은 대기열 진입 이후 Manager에서만 적용됩니다.
-- **admitted 카운터 정합성:** 외부 요인으로 카운터가 일시적으로 높게 유지될 수 있으나, [§12](#12-인가-경로-admission-path) 참조.
 - **CRD 변경 반영 지연:** GlobalLimit CRD 변경 시 최대 5초의 반영 지연이 있습니다.
 - **HA Failover 지연:** Leader 장애 시 최대 ~15초의 스케줄링 공백이 발생합니다. 이 동안 Webhook은 모든 Pod에서 정상 처리됩니다.
 - **관리 SA 패턴 변경 시 재배포 필요:** `MANAGED_SA_PATTERNS` 환경변수 변경은 Pod 재시작이 필요합니다. SA 패턴 추가는 `spec.managedSAPatterns` 배열에 항목을 추가하면 재배포 없이 반영됩니다.
-- **self-healing 임계값 고정:** `ADMITTED_LEAK_HEAL_SEC`(30초)는 현재 상수입니다. 향후 CRD 노출을 검토할 수 있습니다.
 - **self-healing 관측성:** 자가 치유 발동은 현재 **로그로만** 기록됩니다. SRE 알람 연동을 위한 전용 Prometheus 카운터(예: `tekton_queue_self_healing_total`) 노출은 향후 과제입니다.
 
 ---
