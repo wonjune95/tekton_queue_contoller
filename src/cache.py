@@ -1,7 +1,7 @@
 """
-캐시 및 admitted 카운터 모듈.
+PipelineRun 인메모리 캐시 모듈.
 
-PipelineRun 인메모리 캐시와 HA 환경의 cross-pod admitted 카운터를 관리합니다.
+Watch 인포머가 채우는 PipelineRun 인메모리 캐시를 관리합니다.
 """
 import threading
 import datetime
@@ -22,10 +22,6 @@ from src import metrics as m
 local_cache: dict = {}
 cache_lock = threading.Lock()
 
-# ─── Webhook admitted 카운터 (ConfigMap primary, per-pod fallback) ─
-webhook_admitted_count: int = 0
-admitted_lock = threading.Lock()
-ADMITTED_CM_NAME = "tekton-queue-admitted-count"
 
 
 # ─── 유틸리티 ─────────────────────────────────────────────────
@@ -50,130 +46,6 @@ def is_pipelinerun_finished(item: dict) -> bool:
     return False
 
 
-# ─── ConfigMap admitted 카운터 함수 ──────────────────────────
-def _ensure_admitted_configmap():
-    try:
-        core_api.create_namespaced_config_map(
-            LEASE_NAMESPACE,
-            k8s_client.V1ConfigMap(
-                metadata=k8s_client.V1ObjectMeta(name=ADMITTED_CM_NAME, namespace=LEASE_NAMESPACE),
-                data={'admitted': '0'}
-            )
-        )
-        log(f"[AdmittedCM] ConfigMap {LEASE_NAMESPACE}/{ADMITTED_CM_NAME} 생성 완료")
-    except ApiException as e:
-        if e.status != 409:
-            raise
-
-
-def _try_increment_global_admitted(running_cnt: int, limit: int, max_retries: int = 5):
-    global webhook_admitted_count
-
-    # A1′ (카운터 격리 조건, 에이블레이션 전용):
-    # disableAdmittedCounter=true 이면 admitted 추적을 비활성화하고 running 수만으로 슬롯을
-    # 판정한다. Watch 인포머 지연 창에서 running_cnt 가 실제 승인 수를 따라가지 못해
-    # 순간 상한 초과(L_max+δ)가 노출된다. 평시에는 사용하지 않는다.
-    if get_cached_config().get("disable_admitted_counter", False):
-        if running_cnt >= limit:
-            return False, running_cnt
-        return True, running_cnt
-
-    for _ in range(max_retries):
-        try:
-            cm = core_api.read_namespaced_config_map(ADMITTED_CM_NAME, LEASE_NAMESPACE)
-            admitted = int(cm.data.get('admitted', '0'))
-            effective_running = running_cnt + admitted
-            if effective_running >= limit:
-                return False, effective_running
-            cm.data['admitted'] = str(admitted + 1)
-            core_api.replace_namespaced_config_map(ADMITTED_CM_NAME, LEASE_NAMESPACE, cm)
-            return True, effective_running
-        except ApiException as e:
-            if e.status == 409:
-                continue
-            elif e.status == 404:
-                try:
-                    _ensure_admitted_configmap()
-                except Exception:
-                    break
-                continue
-            else:
-                log(f"[AdmittedCM] ConfigMap 업데이트 실패 (API {e.status}). per-pod fallback 사용.")
-                break
-        except Exception as e:
-            log(f"[AdmittedCM] ConfigMap 업데이트 실패 ({e}). per-pod fallback 사용.")
-            break
-    with admitted_lock:
-        effective_running = running_cnt + webhook_admitted_count
-        if effective_running < limit:
-            webhook_admitted_count += 1
-            return True, effective_running
-        return False, effective_running
-
-
-def _decrement_global_admitted(max_retries: int = 5):
-    global webhook_admitted_count
-    import time as _time
-    for attempt in range(max_retries):
-        try:
-            cm = core_api.read_namespaced_config_map(ADMITTED_CM_NAME, LEASE_NAMESPACE)
-            admitted = int(cm.data.get('admitted', '0'))
-            if admitted <= 0:
-                return
-            cm.data['admitted'] = str(admitted - 1)
-            core_api.replace_namespaced_config_map(ADMITTED_CM_NAME, LEASE_NAMESPACE, cm)
-            return
-        except ApiException as e:
-            if e.status == 409:
-                continue  # 낙관적 락 충돌: 즉시 재시도
-            elif e.status == 404:
-                return
-            else:
-                log(f"[AdmittedCM] ConfigMap 감소 실패 (API {e.status}, 시도 {attempt+1}/{max_retries}). 재시도 중...")
-                _time.sleep(0.1)
-                continue
-        except Exception as e:
-            log(f"[AdmittedCM] ConfigMap 감소 실패 ({e}, 시도 {attempt+1}/{max_retries}). 재시도 중...")
-            _time.sleep(0.1)
-            continue
-    log("[AdmittedCM] ConfigMap 감소 최대 재시도 초과. 카운터는 다음 Watcher 재동기화 시 자동 교정됩니다.")
-    with admitted_lock:
-        webhook_admitted_count = max(0, webhook_admitted_count - 1)
-
-
-def _reset_global_admitted():
-    global webhook_admitted_count
-    for _ in range(5):
-        try:
-            try:
-                cm = core_api.read_namespaced_config_map(ADMITTED_CM_NAME, LEASE_NAMESPACE)
-                cm.data['admitted'] = '0'
-                core_api.replace_namespaced_config_map(ADMITTED_CM_NAME, LEASE_NAMESPACE, cm)
-            except ApiException as e:
-                if e.status == 404:
-                    _ensure_admitted_configmap()
-                elif e.status == 409:
-                    continue
-                else:
-                    raise
-            with admitted_lock:
-                webhook_admitted_count = 0
-            return
-        except Exception as e:
-            log(f"[AdmittedCM] ConfigMap 초기화 실패 ({e}). per-pod fallback 사용.")
-    with admitted_lock:
-        webhook_admitted_count = 0
-
-
-def _get_global_admitted() -> int:
-    try:
-        cm = core_api.read_namespaced_config_map(ADMITTED_CM_NAME, LEASE_NAMESPACE)
-        return int(cm.data.get('admitted', '0'))
-    except Exception:
-        with admitted_lock:
-            return webhook_admitted_count
-
-
 # ─── 캐시 업데이트 ────────────────────────────────────────────
 def update_cache(event_type: str, obj: dict):
     ns   = obj['metadata']['namespace']
@@ -183,25 +55,12 @@ def update_cache(event_type: str, obj: dict):
     from src.config import is_target_namespace  # 지연 import (순환 방지)
 
     with cache_lock:
-        existing = local_cache.get(key)
-        is_phantom_replacement = (
-            existing is not None and
-            existing.get('metadata', {}).get('resourceVersion') == '__admitted__'
-        )
-        is_new_addition = key not in local_cache
 
         if event_type == 'DELETED' and key in local_cache:
             del local_cache[key]
         elif event_type != 'DELETED':
             local_cache[key] = obj
 
-    if is_target_namespace(ns):
-        if event_type in ('ADDED', 'MODIFIED') and (is_new_addition or is_phantom_replacement):
-            spec_status = obj.get('spec', {}).get('status')
-            if spec_status != 'PipelineRunPending':
-                _decrement_global_admitted()
-        elif event_type == 'DELETED' and is_phantom_replacement:
-            _decrement_global_admitted()
 
 
 # ─── 큐 상태 조회 ─────────────────────────────────────────────

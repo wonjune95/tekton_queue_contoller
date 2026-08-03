@@ -27,7 +27,6 @@ def _reset_global_state():
     state.is_leader = False
     state.initial_sync_done = False
     cache.local_cache.clear()
-    cache.webhook_admitted_count = 0
     config.crd_config.update({
         "max_pipelines":       config.DEFAULT_LIMIT,
         "aging_interval_sec":  config.DEFAULT_AGING_INTERVAL_SEC,
@@ -35,13 +34,11 @@ def _reset_global_state():
         "tier_rules":          config.DEFAULT_TIER_RULES,
         "namespace_patterns":  list(config.DEFAULT_NAMESPACE_PATTERNS),
         "managed_sa_patterns": list(config.MANAGED_SA_PATTERNS),
-        "disable_admitted_counter": config.DEFAULT_DISABLE_ADMITTED_COUNTER,
     })
     yield
     state.is_leader = False
     state.initial_sync_done = False
     cache.local_cache.clear()
-    cache.webhook_admitted_count = 0
 
 
 @pytest.fixture

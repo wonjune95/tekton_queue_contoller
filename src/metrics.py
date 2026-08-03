@@ -25,6 +25,8 @@ METRIC_QUEUE_PENDING = Gauge(
     '대기열에 있는 파이프라인 수',
     ['tier']
 )
+# (구버전 지표) 웹훅이 직접 인가하던 시절의 카운터. 인가가 매니저로 단일화되어
+# **더 이상 증가하지 않는다.** 기존 대시보드 호환을 위해 정의만 남긴다.
 METRIC_WEBHOOK_ADMITTED = Counter(
     'tekton_queue_webhook_admitted_total',
     'Webhook을 통해 즉시 실행이 허용된 횟수',

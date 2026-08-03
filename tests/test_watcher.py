@@ -12,8 +12,7 @@ class TestWatcherSync:
     @patch('src.workers.watcher.watch')
     @patch('src.workers.watcher.time.sleep', side_effect=InterruptedError)
     @patch('src.workers.watcher.api')
-    @patch('src.workers.watcher._reset_global_admitted')
-    def test_initial_sync_populates_cache(self, mock_reset, mock_api, mock_sleep, mock_watch):
+    def test_initial_sync_populates_cache(self, mock_api, mock_sleep, mock_watch):
         """초기 동기화 시 전체 PR을 캐시에 로드한다."""
         from src.workers.watcher import watcher_loop
         raw_resp = MagicMock()
@@ -42,8 +41,7 @@ class TestWatcherSync:
     @patch('src.workers.watcher.watch')
     @patch('src.workers.watcher.time.sleep', side_effect=InterruptedError)
     @patch('src.workers.watcher.api')
-    @patch('src.workers.watcher._reset_global_admitted')
-    def test_initial_sync_clears_old_cache(self, mock_reset, mock_api, mock_sleep, mock_watch):
+    def test_initial_sync_clears_old_cache(self, mock_api, mock_sleep, mock_watch):
         """재동기화 시 기존 캐시를 클리어한다."""
         from src.workers.watcher import watcher_loop
         cache.local_cache["stale/entry"] = {"old": True}
@@ -65,8 +63,7 @@ class TestWatcherSync:
     @patch('src.workers.watcher.watch')
     @patch('src.workers.watcher.time.sleep', side_effect=[None, InterruptedError])
     @patch('src.workers.watcher.api')
-    @patch('src.workers.watcher._reset_global_admitted')
-    def test_410_gone_triggers_resync(self, mock_reset, mock_api, mock_sleep, mock_watch):
+    def test_410_gone_triggers_resync(self, mock_api, mock_sleep, mock_watch):
         """410 Gone 에러 시 전체 재동기화를 트리거한다."""
         from src.workers.watcher import watcher_loop
         call_count = [0]
@@ -107,8 +104,7 @@ class TestWatcherStreamEvents:
     @patch('src.workers.watcher.watch')
     @patch('src.workers.watcher.time.sleep', side_effect=InterruptedError)
     @patch('src.workers.watcher.api')
-    @patch('src.workers.watcher._reset_global_admitted')
-    def test_stream_added_event_updates_cache(self, mock_reset, mock_api, mock_sleep, mock_watch):
+    def test_stream_added_event_updates_cache(self, mock_api, mock_sleep, mock_watch):
         """Watch 스트림 ADDED 이벤트가 캐시에 반영된다."""
         from src.workers.watcher import watcher_loop
         raw_resp = MagicMock()
@@ -138,8 +134,7 @@ class TestWatcherStreamEvents:
     @patch('src.workers.watcher.watch')
     @patch('src.workers.watcher.time.sleep', side_effect=InterruptedError)
     @patch('src.workers.watcher.api')
-    @patch('src.workers.watcher._reset_global_admitted')
-    def test_stream_deleted_event_removes_from_cache(self, mock_reset, mock_api, mock_sleep, mock_watch):
+    def test_stream_deleted_event_removes_from_cache(self, mock_api, mock_sleep, mock_watch):
         """Watch 스트림 DELETED 이벤트가 캐시에서 항목을 제거한다."""
         from src.workers.watcher import watcher_loop
         # 초기 동기화에 포함시켜 캐시에 올려 놓음
@@ -174,8 +169,7 @@ class TestWatcherStreamEvents:
     @patch('src.workers.watcher.watch')
     @patch('src.workers.watcher.time.sleep', side_effect=[None, InterruptedError])
     @patch('src.workers.watcher.api')
-    @patch('src.workers.watcher._reset_global_admitted')
-    def test_generic_exception_preserves_resource_version(self, mock_reset, mock_api, mock_sleep, mock_watch):
+    def test_generic_exception_preserves_resource_version(self, mock_api, mock_sleep, mock_watch):
         """스트림 중 일반 예외 발생 시 resource_version을 보존하여 전체 재동기화를 하지 않는다."""
         from src.workers.watcher import watcher_loop
         resp = MagicMock()
@@ -192,14 +186,10 @@ class TestWatcherStreamEvents:
             pass
         # 전체 재동기화(list)가 최초 1회만 호출 → resource_version 보존 확인
         assert mock_api.list_cluster_custom_object.call_count == 1
-        # admitted 카운터 리셋은 최초 동기화 1회만
-        assert mock_reset.call_count == 1
-
     @patch('src.workers.watcher.watch')
     @patch('src.workers.watcher.time.sleep', side_effect=[None, InterruptedError])
     @patch('src.workers.watcher.api')
-    @patch('src.workers.watcher._reset_global_admitted')
-    def test_non_410_api_error_preserves_resource_version(self, mock_reset, mock_api, mock_sleep, mock_watch):
+    def test_non_410_api_error_preserves_resource_version(self, mock_api, mock_sleep, mock_watch):
         """410 이외의 API 에러는 resource_version을 보존하고 재동기화를 트리거하지 않는다."""
         from src.workers.watcher import watcher_loop
         resp = MagicMock()
@@ -219,8 +209,7 @@ class TestWatcherStreamEvents:
     @patch('src.workers.watcher.watch')
     @patch('src.workers.watcher.time.sleep', side_effect=InterruptedError)
     @patch('src.workers.watcher.api')
-    @patch('src.workers.watcher._reset_global_admitted')
-    def test_initial_sync_done_stays_true_on_resync(self, mock_reset, mock_api, mock_sleep, mock_watch):
+    def test_initial_sync_done_stays_true_on_resync(self, mock_api, mock_sleep, mock_watch):
         """이미 동기화 완료된 상태에서 재동기화 시 initial_sync_done이 True를 유지한다."""
         from src.workers.watcher import watcher_loop
         state.initial_sync_done = True

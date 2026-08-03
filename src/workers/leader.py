@@ -14,7 +14,6 @@ from src.config import (
     LEASE_NAME, LEASE_NAMESPACE, POD_NAME,
     LEASE_DURATION_SEC, LEASE_RETRY_PERIOD_SEC, log,
 )
-from src.cache import _reset_global_admitted
 from src import metrics as m
 from src import state
 
@@ -72,7 +71,6 @@ def leader_election_loop():
                     was_leader      = state.is_leader
                     state.is_leader = True
                 if not was_leader:
-                    _reset_global_admitted()
                     log(f"[LeaderElection] Leader 승격 (이전 Leader: {holder}, Lease 만료)")
             else:
                 with state.leader_lock:

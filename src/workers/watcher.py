@@ -11,7 +11,7 @@ from kubernetes import watch
 from kubernetes.client.rest import ApiException
 
 from src.config import log, api
-from src.cache import local_cache, cache_lock, update_cache, _reset_global_admitted
+from src.cache import local_cache, cache_lock, update_cache
 from src import metrics as m
 from src import state
 
@@ -36,7 +36,6 @@ def watcher_loop():
                 with cache_lock:
                     local_cache.clear()
                     local_cache.update(new_cache)
-                _reset_global_admitted()
                 if not state.initial_sync_done:
                     state.initial_sync_done = True
                     log("초기 동기화 완료. Webhook 트래픽 수신을 시작합니다.")

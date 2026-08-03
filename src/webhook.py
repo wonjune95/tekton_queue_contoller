@@ -18,7 +18,7 @@ from src.config import (
 from src.cache import (
     local_cache, cache_lock,
     get_queue_status_from_cache,
-    _get_global_admitted, parse_k8s_timestamp,
+    parse_k8s_timestamp,
 )
 from src import metrics as m
 from src import state
@@ -114,7 +114,7 @@ def mutate_pipelinerun():
     # ── 인가 주체 단일화 ────────────────────────────────────────────
     # 이전 구현은 슬롯이 있으면 웹훅이 그 자리에서 인가하고, 없으면 대기열로 보냈다.
     # 웹훅은 요청마다 독립적으로 실행되므로 동시 인가 요청이 들어오면 각 요청이
-    # 자기 시점의 running 수와 admitted 카운터를 보고 판정한다. 카운터가 감소하는
+    # 자기 시점의 running 수를 보고 판정한다. 그 값이 갱신되는
     # 시점과 그 건이 running 수에 반영되는 시점이 어긋나는 창에서 슬롯이 비어 보이고,
     # 매니저까지 대기열을 풀면서 상한이 깨진다.
     #   실측: 동시 12요청에서 상한 30 에 대해 최대 48 까지 올라갔고 초과가 872초 지속됐다.

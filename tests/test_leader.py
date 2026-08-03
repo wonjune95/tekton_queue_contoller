@@ -21,8 +21,7 @@ def _make_lease(holder="other-pod", renew_time=None, duration=15):
 class TestLeaderElection:
     @patch('src.workers.leader.time.sleep', side_effect=InterruptedError)
     @patch('src.workers.leader.k8s_client.CoordinationV1Api')
-    @patch('src.workers.leader._reset_global_admitted')
-    def test_create_new_lease(self, mock_reset, MockCoord, mock_sleep):
+    def test_create_new_lease(self, MockCoord, mock_sleep):
         """Lease가 없으면 새로 생성하고 리더가 된다."""
         from src.workers.leader import leader_election_loop
         coord = MockCoord.return_value
@@ -53,9 +52,8 @@ class TestLeaderElection:
 
     @patch('src.workers.leader.time.sleep', side_effect=[None, InterruptedError])
     @patch('src.workers.leader.k8s_client.CoordinationV1Api')
-    @patch('src.workers.leader._reset_global_admitted')
     @patch('src.workers.leader.POD_NAME', 'my-pod')
-    def test_takeover_expired_lease(self, mock_reset, MockCoord, mock_sleep):
+    def test_takeover_expired_lease(self, MockCoord, mock_sleep):
         """Lease 만료 시 탈취하여 리더가 된다."""
         from src.workers.leader import leader_election_loop
         coord = MockCoord.return_value
@@ -67,7 +65,6 @@ class TestLeaderElection:
         except InterruptedError:
             pass
         assert state.is_leader is True
-        mock_reset.assert_called()
 
     @patch('src.workers.leader.time.sleep', side_effect=[None, InterruptedError])
     @patch('src.workers.leader.k8s_client.CoordinationV1Api')
