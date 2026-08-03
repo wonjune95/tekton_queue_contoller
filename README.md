@@ -4,7 +4,7 @@
 
 **다수의 네임스페이스에 걸친 Tekton PipelineRun의 전역 동시 실행 수를 통제하고, 우선순위 기반으로 스케줄링하는 Kubernetes Admission Webhook 컨트롤러**
 
-[![Tests](https://img.shields.io/badge/tests-158%20passed-2ea44f?logo=pytest&logoColor=white)](#13-검증-verification)
+[![Tests](https://img.shields.io/badge/tests-168%20passed-2ea44f?logo=pytest&logoColor=white)](#13-검증-verification)
 [![Integration](https://img.shields.io/badge/integration%20S1~S4-passed-2ea44f?logo=kubernetes&logoColor=white)](#13-검증-verification)
 [![Python](https://img.shields.io/badge/python-3.11-3776AB?logo=python&logoColor=white)](docker/Dockerfile)
 [![Kubernetes](https://img.shields.io/badge/kubernetes-1.20%2B-326CE5?logo=kubernetes&logoColor=white)](#71-사전-요구사항)
@@ -20,10 +20,10 @@
 
 Tekton Pipelines에는 **클러스터 전역 동시 실행 제한이 없어**, 대량 배포가 몰리면 자원 경쟁으로 OOM·노드 장애가 발생합니다. 이 컨트롤러는 API Server 인입 단계(Admission Webhook)에서 이를 선제 통제합니다.
 
-- **외부 락 스토리지 0** — Redis·ZooKeeper 없이 K8s 네이티브 프리미티브(ConfigMap `resourceVersion` 낙관적 락 + Lease)만으로 다중 Pod 간 전역 쿼터 정합성을 확보
+- **외부 락 스토리지 0** — Redis·ZooKeeper 없이 K8s 네이티브 프리미티브(Lease 기반 Leader Election)만으로 전역 쿼터 정합성을 확보. 인가 결정은 Leader의 매니저 루프 한 곳에서만 일어납니다
 - **비파괴적 제어 + 우선순위** — 쿼터 초과 PR을 삭제/재생성 없이 `PipelineRunPending` 주입으로 보류하고, 티어 + 에이징으로 스케줄링해 기아(starvation)를 방지
 - **HA + 자가 치유** — Lease 기반 Leader Election으로 ~15초 내 Failover, 카운터 누수는 Manager OR-게이트가 30초 내 자동 보정(결과적 정합성)
-- **검증됨** — 158개 단위 테스트 통과 + S1~S4 실클러스터 시나리오에서 동시 실행이 한도를 **단 1건도 초과하지 않음**
+- **검증됨** — 168개 단위 테스트 통과 + 실클러스터 시나리오에서 동시 실행이 한도를 초과하지 않음(직렬·동시 도착 모두)
 
 > 왜 Go가 아니라 Python인지는 [§3 핵심 설계 결정](#-핵심-설계-결정-key-design-decisions)에서 다룹니다.
 
@@ -65,7 +65,7 @@ Tekton Pipelines는 클러스터 전체 단위의 동시 실행 개수를 제한
 | 기능 | 설명 |
 |------|------|
 | **출처 기반 실행 제어** | Tekton Dashboard에서 생성된 PR만 큐를 통해 실행. 배스천 등 외부 출처는 Pending으로 보류 |
-| **전역 동시 실행 제한** | 쿼터 초과 시 `PipelineRunPending` 상태를 즉시 주입하여 자원 고갈 원천 차단 |
+| **전역 동시 실행 제한** | 생성 요청을 `PipelineRunPending`으로 보류하고, 매니저가 빈 슬롯만큼만 실행시켜 자원 고갈 원천 차단 |
 | **우선순위 스케줄링** | CRD 기반 티어 분류 + 에이징(Aging) 메커니즘으로 기아(Starvation) 방지 |
 | **멀티 네임스페이스** | 복수 패턴 기반 네임스페이스 필터링 (fnmatch 문법) |
 | **고가용성 (HA)** | Kubernetes Lease 기반 Leader Election으로 다중 Pod 구성 지원 |
@@ -98,19 +98,27 @@ flowchart TD
     C -- "No (배스천/CI 등)" --> H[/spec.status = PipelineRunPending<br/>managed 라벨 없음 → 스케줄링 제외/]
     C -- Yes --> D{캐시 초기 동기화 완료?}
     D -- No --> P
-    D -- Yes --> E{"running + admitted &lt; limit ?"}
-    E -- "No (쿼터 초과)" --> Q[/Pending + managed 라벨<br/>대기열 진입/]
-    E -- Yes --> F[ConfigMap admitted +1<br/>원자적 증가]
-    F --> G([Tier 라벨 주입<br/>즉시 실행 허용])
+    D -- Yes --> Q[/Tier 라벨 + managed 라벨<br/>spec.status = PipelineRunPending<br/>대기열 진입/]
+    Q -.->|매니저 루프가 인가| R([빈 슬롯만큼 실행 시작])
 
     classDef admit fill:#2ea44f,stroke:#1a7f37,color:#fff;
     classDef hold fill:#d29922,stroke:#9a6700,color:#fff;
-    class G,P admit;
+    class R,P admit;
     class H,Q hold;
 ```
 
-- **Dashboard** (`tekton-dashboard` SA): 쿼터 여유 시 즉시 실행, 쿼터 초과 시 대기열 진입
+- **Dashboard** (`tekton-dashboard` SA): 쿼터와 무관하게 **항상 대기열에 진입**하고, 실행 시작은 매니저 루프가 결정합니다.
 - **그 외 출처**: 항상 `PipelineRunPending` 설정, 매니저가 절대 스케줄링하지 않음
+
+> **왜 웹훅이 직접 인가하지 않는가**
+>
+> 웹훅은 요청마다 독립적으로 실행됩니다. 슬롯 확인과 실행 허용을 웹훅에서 처리하면,
+> 동시에 들어온 요청들이 각자 자기 시점의 상태를 보고 판정하기 때문에 순간적으로 상한을 넘길 수 있습니다.
+> 실측에서 동시 12요청 시 상한 30에 대해 최대 48까지 올라갔습니다(직렬 도착에서는 재현되지 않음).
+>
+> 그래서 **인가 결정은 매니저 루프 한 곳에서만** 수행합니다. 결정이 단일 스레드에서 직렬로 일어나므로
+> 경쟁이 성립하지 않으며, 매니저는 한 사이클에서 실행시킨 건수를 세어 남은 슬롯을 차감합니다.
+> 대가로 슬롯이 비어 있어도 다음 사이클까지 대기합니다(최대 약 5초).
 
 ### 2.2. 대기열 스케줄링 흐름
 
@@ -208,7 +216,7 @@ sequenceDiagram
 
 | 문제 | 선택한 설계 | 대안 대비 이점 |
 |------|-------------|----------------|
-| 다중 Pod 간 전역 쿼터 정합성 | ConfigMap + `resourceVersion` 낙관적 락 + phantom 엔트리 | Redis 등 외부 분산 락 스토리지 불필요 → 인프라 의존성 0 ([§12](#12-admitted-카운터--자가-치유-self-healing)) |
+| 다중 Pod 간 전역 쿼터 정합성 | 인가 결정을 매니저 루프 한 곳으로 단일화 (Leader만 수행) | 분산 락·외부 스토리지 불필요 → 인프라 의존성 0 ([§2.1](#21-요청-처리-흐름)) |
 | 쿼터 초과 PR 처리 | Admission 단계에서 `PipelineRunPending` 주입 | PR 강제 삭제/재생성 없는 비파괴적 제어 |
 | 카운터 누수 복구 | Manager 루프 OR-게이트 자가 치유 | 운영자 개입 없이 30초 내 자동 보정 ([§12.2](#122-자가-치유-self-healing)) |
 | 고가용성 | K8s Lease 기반 Leader Election | ZooKeeper 등 외부 코디네이터 직접 운영 불필요 |
@@ -429,7 +437,7 @@ kubectl exec -n tekton-pipelines <pod-name> -- curl -sk https://localhost:8443/h
 | `tekton_queue_limit` | Gauge | - | 글로벌 동시 실행 허용량 |
 | `tekton_queue_running_total` | Gauge | - | 현재 실행 중인 파이프라인 수 |
 | `tekton_queue_pending_total` | Gauge | `tier` | 대기열 파이프라인 수 (Tier별) |
-| `tekton_queue_webhook_admitted_total` | Counter | `tier` | Dashboard PR 즉시 실행 허용 횟수 |
+| `tekton_queue_webhook_admitted_total` | Counter | `tier` | (구버전 지표) 웹훅이 직접 인가하던 시절의 허용 횟수. 현재는 증가하지 않음 |
 | `tekton_queue_webhook_queued_total` | Counter | `tier` | Dashboard PR 쿼터 초과 대기열 진입 횟수 |
 | `tekton_queue_webhook_held_total` | Counter | `tier` | Dashboard 외 출처 PR 보류 횟수 |
 | `tekton_queue_scheduled_total` | Counter | `tier` | Manager 스케줄링 횟수 |
@@ -586,16 +594,30 @@ tekton_queue_controller/
 
 ## 12. admitted 카운터 & 자가 치유 (Self-healing)
 
-### 12.1. 왜 필요한가
+> **현재 구조에서의 위치**
+>
+> 이 카운터는 **웹훅이 직접 인가하던 시절**에 도입된 장치입니다. 당시에는 "웹훅이 통과시켰지만
+> 아직 Watcher 캐시에 running으로 반영되기 전"인 인플라이트 수를 메워야 했습니다.
+>
+> 그러나 이 방식으로는 **동시 인가 요청에서 상한이 깨졌습니다**(실측: 동시 12요청 시 상한 30에 대해 최대 48).
+> 카운터가 감소하는 시점과 그 건이 running 수에 반영되는 시점이 어긋나는 창이 남기 때문입니다.
+> 현재는 [§2.1](#21-요청-처리-흐름)대로 **웹훅이 인가를 판정하지 않고 매니저 루프가 전담**하므로
+> 인플라이트 창 자체가 존재하지 않습니다.
+>
+> 카운터와 자가 치유 로직은 **매니저의 안전망으로 남겨 두었습니다**. 매니저는 여전히
+> `running + admitted` 로 슬롯을 계산하므로, 외부 요인으로 카운터가 남더라도 과잉 인가로 이어지지 않습니다.
+> 아래 설명은 그 안전망의 동작입니다.
 
-Webhook은 **모든 Pod에서** 동작하므로(Service 라운드로빈), 동시에 들어온 CREATE 요청들이 각자 캐시만 보고 판정하면 쿼터를 초과할 수 있습니다. 이를 막기 위해 **클러스터 공용 ConfigMap(`tekton-queue-admitted-count`)** 에 "Webhook이 통과시켰지만 아직 Watcher 캐시에 running으로 반영되기 전" 인플라이트 수를 기록합니다.
+### 12.1. 무엇을 기록하는가
+
+**클러스터 공용 ConfigMap(`tekton-queue-admitted-count`)** 에 인플라이트 수를 기록합니다.
+매니저는 슬롯 계산 시 이 값을 running 수에 더해, 남아 있는 값이 있으면 보수적으로 판단합니다.
 
 ```mermaid
 flowchart LR
-    W["Webhook (모든 Pod)"] -- "낙관적 락 +1<br/>(409 → 재시도)" --> CM[("ConfigMap<br/>admitted")]
-    W -. "phantom 엔트리 삽입<br/>resourceVersion=__admitted__" .-> Cache[(In-Memory Cache)]
-    Watch["Watcher"] -- "실제 PR ADDED 관측<br/>→ phantom 교체 & -1" --> CM
-    CM -- "running + admitted" --> Quota{쿼터 판정}
+    CM[("ConfigMap<br/>admitted")] -- "running + admitted" --> Slot{매니저 슬롯 계산}
+    Slot --> Heal["누수 지속 시<br/>자가 보정 → 0"]
+    Heal --> CM
 
     classDef cm fill:#0969da,stroke:#0a5cc4,color:#fff;
     class CM cm;
@@ -603,9 +625,9 @@ flowchart LR
 
 | 단계 | 동작 |
 |------|------|
-| **증가** | Webhook 통과 시 ConfigMap `admitted` 를 낙관적 락(409 Conflict 재시도)으로 원자적 +1 |
+| **증가** | (구버전) 웹훅이 직접 인가하던 시절 통과 시 +1. **현재 웹훅은 증가시키지 않는다** |
 | **Phantom** | 실명 PR은 캐시에 `resourceVersion: __admitted__` 임시 엔트리 삽입 → Watcher 이벤트 도착 전까지 running으로 집계 |
-| **감소** | Watcher가 실제 PR ADDED를 관측하면 phantom을 교체하고 `admitted` -1 |
+| **감소** | Watcher가 실제 PR ADDED를 관측하면 `admitted` -1 |
 | **Fallback** | ConfigMap API 장애 시 per-pod 로컬 카운터로 graceful degradation |
 
 ### 12.2. 자가 치유 (Self-healing)
@@ -661,7 +683,7 @@ python -m tests.integration_scenarios
 ## 14. 설계 한계 및 향후 과제
 
 - **비선점형 설계:** 실행 중인 낮은 티어 파이프라인의 선점은 지원하지 않습니다. 우선순위 정렬은 대기열 진입 이후 Manager에서만 적용됩니다.
-- **admitted 카운터 정합성:** Webhook 통과 후 PR 생성 실패 등으로 카운터가 일시적으로 높게 유지될 수 있으나, [§12.2 자가 치유](#122-자가-치유-self-healing)가 누수를 30초 내 자동 보정하며 Watcher 전체 재동기화 시에도 리셋됩니다.
+- **admitted 카운터 정합성:** 외부 요인으로 카운터가 일시적으로 높게 유지될 수 있으나, [§12.2 자가 치유](#122-자가-치유-self-healing)가 누수를 30초 내 자동 보정하며 Watcher 전체 재동기화 시에도 리셋됩니다.
 - **CRD 변경 반영 지연:** GlobalLimit CRD 변경 시 최대 5초의 반영 지연이 있습니다.
 - **HA Failover 지연:** Leader 장애 시 최대 ~15초의 스케줄링 공백이 발생합니다. 이 동안 Webhook은 모든 Pod에서 정상 처리됩니다.
 - **관리 SA 패턴 변경 시 재배포 필요:** `MANAGED_SA_PATTERNS` 환경변수 변경은 Pod 재시작이 필요합니다. SA 패턴 추가는 `spec.managedSAPatterns` 배열에 항목을 추가하면 재배포 없이 반영됩니다.
